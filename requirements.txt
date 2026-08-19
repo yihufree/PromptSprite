@@ -1,0 +1,7 @@
+customtkinter>=5.2.0
+Pillow>=10.0.0
+pyperclip>=1.8.0
+openpyxl>=3.1.0
+keyboard>=0.13.5
+pystray>=0.19.0
+# 2026-08-18（第020条，P2-R2 修复）：移除未引用的冗余依赖 python-dateutil（grep 全代码无 import）
