@@ -8,7 +8,7 @@ import sys
 
 # ---------- 应用基础信息 ----------
 APP_NAME = "PromptSprite"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"  # 2026-08-21（第006条）：0.1.0 → 0.2.0（新增分类复制/移动、锁定范围收紧、"关于"信息）
 
 # ---------- 数据库 / 目录 ----------
 DB_FILE_NAME = "prompts.db"

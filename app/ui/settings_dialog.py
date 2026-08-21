@@ -72,10 +72,35 @@ class SettingsDialog(ctk.CTkToplevel):
         # 按钮
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
         btn_row.grid(row=5, column=0, columnspan=2, sticky="e", padx=pad, pady=(8, 16))
+        ctk.CTkButton(btn_row, text="ℹ 关于", width=96, fg_color="#8a94a6",  # 2026-08-21（第006条）：关于入口
+                      command=self._show_about).pack(side="left", padx=4)
         ctk.CTkButton(btn_row, text="确定", width=96, fg_color="#2E8B57",
                       command=self._apply).pack(side="left", padx=4)
         ctk.CTkButton(btn_row, text="取消", width=96,
                       command=self.destroy).pack(side="left", padx=4)
+
+    def _show_about(self) -> None:
+        """关于窗口：显示软件名、版本与简介（2026-08-21 第006条新增）"""
+        win = ctk.CTkToplevel(self)
+        win.title("关于")
+        win.resizable(False, False)
+        win.transient(self)
+        win.grab_set()
+        info = (
+            f"{config.APP_NAME}（提示精灵）\n\n"
+            f"版本：{config.APP_VERSION}\n\n"
+            "AI 提示词管理工具：四级分类书架 + 极速检索 + 一键复制。\n"
+            "数据全部保存在本机，无任何联网行为。"
+        )
+        ctk.CTkLabel(win, text=info, font=("Microsoft YaHei", 13),
+                     justify="left").pack(padx=24, pady=(20, 8))
+        ctk.CTkButton(win, text="关闭", width=88,
+                      command=win.destroy).pack(pady=(4, 16))
+        win.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - win.winfo_width()) // 2
+        y = self.winfo_y() + (self.winfo_height() - win.winfo_height()) // 2
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        win.lift()
 
     def _on_remember_toggle(self) -> None:
         # 打开"记住窗口大小"时，立即记录当前窗口大小

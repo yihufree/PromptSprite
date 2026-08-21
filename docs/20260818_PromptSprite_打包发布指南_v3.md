@@ -76,7 +76,7 @@ python build.py
 
 ### 5.1 发布前检查清单
 
-1. **版本号**：`app/config.py` 的 `APP_VERSION` / `BUILTIN_MANUAL_VERSION` 确认（当前 0.1.0 / 007-2026-08-18）；
+1. **版本号**：`app/config.py` 的 `APP_VERSION` / `BUILTIN_MANUAL_VERSION` 确认（当前 0.2.0 / 007-2026-08-18；2026-08-21 第006条：0.1.0 → 0.2.0）；
 2. **文档同步**（本次 V1.2 发布应全部更新）：
    - README.md（功能/快速开始/数据规模/文档索引，索引指向 V4/V3 文档）；
    - 说明书 V3（docs/20260818_PromptSprite_软件安装使用说明书_v3.md）；

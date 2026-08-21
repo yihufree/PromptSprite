@@ -3,6 +3,7 @@
 > AI 提示词管理工具 —— 把杂乱无章的 Prompt 文档，变成 **四级分类书架 + 极速检索 + 一键复制** 的本地神器。
 
 ![Platform](https://img.shields.io/badge/Platform-Windows_10%2F11-blue)
+![Version](https://img.shields.io/badge/Version-0.2.0-blueviolet)  <!-- 2026-08-21（第006条）：0.1.0 → 0.2.0 -->
 ![Python](https://img.shields.io/badge/Python-3.10%2B-green)
 ![UI](https://img.shields.io/badge/UI-CustomTkinter-2E8B57)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
@@ -21,14 +22,15 @@
 | ③ 一键复制 | 复制全部 / 复制中文 / 复制英文 三种方式 |
 | ④ 快捷悬停添加 | 鼠标悬停滑过分类即锁定，光标自动跳入输入框快速新建，连续录入不打断 |
 | ⑤ 悬停选中与高亮 | 主界面"鼠标悬浮 0.3 秒即选中"，选中链路高亮；底部状态栏按悬停层级动态统计 |
-| ⑥ 安全回收 | 全局锁定 + 删除双重确认 + 删除分类条目转"未分类" + 删除根目录仅解除关联 |
+| ⑥ 安全回收 | 全局锁定（🔒：仅查询与复制详情内容，移动/删除/新增/"复制到"全部禁用）+ 删除双重确认 + 删除分类条目转"未分类" + 删除根目录仅解除关联 |
 | ⑦ 收藏与搜索 | ⭐常用入口；全局搜索实时过滤全部文本字段 |
 | ⑧ 导入导出 | JSON/Excel/HTML/MD（进度条）；**导入按内容自动去重**；批量事务导入 |
 | ⑨ 自动备份 | 每次启动自动备份，仅保留最近 5 份，失败状态栏警告 |
 | ⑩ 全局热键/托盘 | `Ctrl+Shift+P` 唤出聚焦搜索；`ESC` 隐藏；托盘恢复/退出 |
 | ⑪ 内置数据 | 首次启动自动导入 90 条视觉风格提示词；升级"非破坏性合并"不丢用户数据 |
-| ⑫ 用户设置 | 记住窗口大小、默认视图（卡片/列表）、详情字段策略（自动/全部/精简） |
-| ⑬ 一键打包 | `python build.py` 自动生成单文件 EXE |
+| ⑫ 用户设置 | 记住窗口大小、默认视图（卡片/列表）、详情字段策略（自动/全部/精简）；"ℹ 关于"显示版本信息 |
+| ⑬ 分类复制/移动 | 根目录/一级/二级可"复制到…/移动到…"其他位置：下移加前缀（A→A.C）、上移去前缀、重名自动加序号、共享分类自动复制、移动不丢条目（2026-08-21 第004条） |
+| ⑭ 一键打包 | `python build.py` 自动生成单文件 EXE |
 
 ## 📊 内置数据（开箱即用）
 
@@ -109,7 +111,7 @@ PromptSprite/
 │   ├── hotkey.py             # 全局热键 + 系统托盘
 │   ├── self_test.py          # 统一自测入口
 │   ├── parser/               # md_parser / json_io / excel_io / html_export
-│   ├── ui/                   # main_window / quick_add / move_selector / progress_dialog / settings_dialog
+│   ├── ui/                   # main_window / quick_add / copy_move_dialog / move_selector / progress_dialog / settings_dialog
 │   └── resources/builtin_manual.md   # 内置手册（90 条）
 ├── docs/                     # 需求规格V4 / 审核报告V3 / 说明书V3 / 打包指南V3 / 施工方案 / 开发记录
 ├── Icons/                    # 应用图标源（PSicon.png）
@@ -129,9 +131,12 @@ PromptSprite/
 | 文档 | 说明 |
 | ---- | ---- |
 | [项目需求规格和开发规划设计方案（V4.0）](docs/20260818_PromptSprite项目需求规格和开发规划设计方案_v4.md) | 当前版需求规格与规划 |
+| [项目审核和修改建议报告（V3.0）](docs/20260818_PromptSprite_项目审核和修改建议报告_v3.md) | 六维审核结论与 P2/P3 修改建议 |
 | [软件安装使用说明书（V3.0）](docs/20260818_PromptSprite_软件安装使用说明书_v3.md) | 面向小白的完整使用指南 |
 | [打包发布指南（V3.0）](docs/20260818_PromptSprite_打包发布指南_v3.md) | 打包与 GitHub Releases 发布全流程 |
-
+| [施工方案（V1.1）](docs/20260812_PromptSprite_施工方案.md) | 原始施工方案与验收清单 |
+| [开发工作记录 01](20260812_PromptSprite_01_开发工作记录.md) | 第 001-021 条开发记录 |
+| [开发工作记录 02](20260818_PromptSprite_02_开发工作记录.md) | 2026-08-18 起新记录卷 |
 
 ## 🤝 参与贡献
 

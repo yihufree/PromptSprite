@@ -32,6 +32,7 @@ import pyperclip
 from .. import config
 from ..models import Entry
 from ..parser import excel_io, html_export, json_io, md_parser
+from .copy_move_dialog import CopyMoveDialog  # 2026-08-21（第004条）：各级目录"复制到/移动到"
 from .move_selector import MoveSelector
 from .progress_dialog import ProgressDialog
 from .quick_add import QuickAddWindow
@@ -254,8 +255,9 @@ class MainWindow(ctk.CTk):
         self.export_btn.bind("<Button-1>",
                              lambda e: self.export_menu.tk_popup(e.x_root, e.y_root))
 
-        ctk.CTkButton(bar, text="✚ 快速新建", width=110, command=self._quick_add
-                      ).grid(row=0, column=7, padx=(4, 4))
+        self.quick_add_btn = ctk.CTkButton(bar, text="✚ 快速新建", width=110,
+                                           command=self._quick_add)
+        self.quick_add_btn.grid(row=0, column=7, padx=(4, 4))
         ctk.CTkButton(bar, text="⚙ 设置", width=80, command=self._open_settings  # 2026-08-18：设置入口
                       ).grid(row=0, column=8, padx=(4, 14))
 
@@ -478,6 +480,7 @@ class MainWindow(ctk.CTk):
         self._clear_frame(self.l0_frame)
         self._clear_nav_btns("l0")
         ctk.CTkButton(self.l0_frame, text="➕ 新增根目录", height=30, **_ADD_BTN,
+                      state="disabled" if self._lock_on else "normal",  # 2026-08-21（第005条）：锁定时禁用新增
                       command=self._add_domain).pack(fill="x", padx=6, pady=3)
         for d in self.db.list_domains():
             btn = ctk.CTkButton(self.l0_frame, text=d["name"], anchor="w", height=32,
@@ -538,6 +541,8 @@ class MainWindow(ctk.CTk):
 
     def _add_l1(self) -> None:
         """一级分类新增按钮：在当前领域下新建一级分类并建立领域关联"""
+        if self._lock_on:  # 2026-08-21（第005条）：锁定时禁止新增
+            return
         if self._cur_domain_id is None:
             self.toast("请先选择根目录", color="#D9534F")
             return
@@ -550,6 +555,7 @@ class MainWindow(ctk.CTk):
         self._clear_frame(self.l1_frame)
         self._clear_nav_btns("l1")
         ctk.CTkButton(self.l1_frame, text="➕ 新增一级分类", height=28, **_ADD_BTN,
+                      state="disabled" if self._lock_on else "normal",  # 2026-08-21（第005条）：锁定时禁用新增
                       command=self._add_l1).pack(fill="x", padx=6, pady=2)
         for c in self.db.list_categories(domain_id=self._cur_domain_id, parent_id=None):
             btn = ctk.CTkButton(self.l1_frame, text=c["name"], anchor="w", height=30,
@@ -570,6 +576,8 @@ class MainWindow(ctk.CTk):
 
     def _add_l2(self) -> None:
         """二级分类新增按钮：在当前分类下新建子分类"""
+        if self._lock_on:  # 2026-08-21（第005条）：锁定时禁止新增
+            return
         if self._cur_cat_id is None:
             self.toast("请先在左侧选中分类", color="#D9534F")
             return
@@ -583,6 +591,7 @@ class MainWindow(ctk.CTk):
         self._clear_nav_btns("l2")
         parent_id = self._l2_parent_id()
         ctk.CTkButton(self.l2_frame, text="➕ 新增二级分类", height=28, **_ADD_BTN,
+                      state="disabled" if self._lock_on else "normal",  # 2026-08-21（第005条）：锁定时禁用新增
                       command=self._add_l2).pack(fill="x", padx=6, pady=2)
         if parent_id is not None:
             for c in self.db.list_categories(parent_id=parent_id):
@@ -1136,22 +1145,30 @@ class MainWindow(ctk.CTk):
             self.toast("复制失败，请检查剪贴板", color="#D9534F")
 
     def _toggle_favorite(self, entry_id: int) -> None:
+        if self._lock_on:  # 2026-08-21（第005条）：锁定时禁止修改收藏状态
+            return
         self.db.toggle_favorite(entry_id)
         self._restore_view()              # 刷新列表中的星标
         if self._detail_entry_id == entry_id:
             self._show_detail(self.db.get_entry(entry_id))
 
     def _entry_menu(self, event, entry_id: int) -> None:
+        lock_state = "disabled" if self._lock_on else "normal"  # 2026-08-21（第005条）：锁定时仅"复制提示词"可用
         m = tk.Menu(self, tearoff=0)
-        m.add_command(label="移动到分类…", command=lambda: self._move_entry(entry_id))
-        m.add_command(label="收藏 / 取消收藏", command=lambda: self._toggle_favorite(entry_id))
+        m.add_command(label="移动到分类…", state=lock_state,
+                      command=lambda: self._move_entry(entry_id))
+        m.add_command(label="收藏 / 取消收藏", state=lock_state,
+                      command=lambda: self._toggle_favorite(entry_id))
         m.add_command(label="复制提示词（全部）",
                       command=lambda: self._copy_entry(entry_id, _COPY_ALL))
         m.add_separator()
-        m.add_command(label="删除", command=lambda: self._delete_entry(entry_id))
+        m.add_command(label="删除", state=lock_state,
+                      command=lambda: self._delete_entry(entry_id))
         m.tk_popup(event.x_root, event.y_root)
 
     def _move_entry(self, entry_id: int) -> None:
+        if self._lock_on:  # 2026-08-21（第005条）：锁定时禁止条目移动
+            return
         sel = MoveSelector(self, self.db)
         self.wait_window(sel)
         if sel.result in ("ok", "uncategorized"):
@@ -1186,33 +1203,164 @@ class MainWindow(ctk.CTk):
         self._apply_lock_state()
         self.toast("已开启全局锁定，删除功能已禁用" if self._lock_on else "已解除锁定")
 
+    def _set_child_states(self, widget, state: str) -> None:
+        """递归设置某容器下所有控件的 state（锁定状态切换用，2026-08-21 第005条新增）"""
+        for child in widget.winfo_children():
+            try:
+                child.configure(state=state)
+            except Exception:
+                pass
+            self._set_child_states(child, state)
+
     def _apply_lock_state(self) -> None:
-        if hasattr(self, "del_btn"):
-            self.del_btn.configure(state="disabled" if self._lock_on else "normal")
+        """锁定：只能查询和复制，禁止移动/删除/新增/重命名/导入/编辑保存等（2026-08-21 第005条扩展）"""
+        locked = self._lock_on
+        state = "disabled" if locked else "normal"
+        for attr in ("del_btn", "fav_btn", "save_btn", "reset_btn",
+                     "import_btn", "quick_add_btn"):
+            w = getattr(self, attr, None)
+            if w is not None and w.winfo_exists():
+                w.configure(state=state)
+        # 详情名称输入框 + 详情滚动区编辑控件（复制按钮不受影响）
+        if hasattr(self, "_name_entry") and self._name_entry.winfo_exists():
+            self._name_entry.configure(state=state)
+        if hasattr(self, "detail_scroll") and self.detail_scroll.winfo_exists():
+            self._set_child_states(self.detail_scroll, state)
+        # 导入菜单项（导入=新增数据，锁定时禁用）
+        if hasattr(self, "import_menu"):
+            try:
+                last = self.import_menu.index("end")
+            except Exception:
+                last = None
+            if last is not None:
+                for i in range(last + 1):
+                    self.import_menu.entryconfigure(i, state=state)
+        # 重建新增按钮（l0/l1/l2 的"➕新增…"按锁定置灰）
+        self._refresh_l0()
+        self._refresh_l1()
+        self._refresh_l2()
 
     # ------------------------------------------------------------------ #
     # 根目录 / 分类 右键菜单
     # ------------------------------------------------------------------ #
     def _domain_menu(self, event, domain_id: int, name: str) -> None:
+        lock_state = "disabled" if self._lock_on else "normal"  # 2026-08-21（第006条）：锁定时"复制到"同样禁用
         m = tk.Menu(self, tearoff=0)
-        m.add_command(label="重命名", command=lambda: self._rename_domain(domain_id))
-        m.add_command(label="删除", command=lambda: self._delete_domain(domain_id))
+        # 2026-08-21（第004条）：根目录"复制到/移动到"
+        m.add_command(label="复制到…", state=lock_state,
+                      command=lambda: self._copy_move_domain(domain_id, "copy"))
+        m.add_command(label="移动到…", state=lock_state,
+                      command=lambda: self._copy_move_domain(domain_id, "move"))
+        m.add_separator()
+        m.add_command(label="重命名", state=lock_state,
+                      command=lambda: self._rename_domain(domain_id))
+        m.add_command(label="删除", state=lock_state,
+                      command=lambda: self._delete_domain(domain_id))
         m.tk_popup(event.x_root, event.y_root)
 
     def _category_menu(self, event, cat_id: int, name: str) -> None:
+        cat = self.db.get_category(cat_id)
+        src_type = "l1" if (cat and cat["parent_id"] is None) else "l2"
+        lock_state = "disabled" if self._lock_on else "normal"  # 2026-08-21（第006条）：锁定时"复制到"同样禁用
         m = tk.Menu(self, tearoff=0)
-        m.add_command(label="新增子分类", command=lambda: self._add_subcategory(cat_id))
-        m.add_command(label="重命名", command=lambda: self._rename_category(cat_id))
-        m.add_command(label="删除", command=lambda: self._delete_category(cat_id))
+        # 2026-08-21（第004条）：一级/二级分类"复制到/移动到"
+        m.add_command(label="复制到…", state=lock_state,
+                      command=lambda: self._copy_move_category(src_type, cat_id, "copy"))
+        m.add_command(label="移动到…", state=lock_state,
+                      command=lambda: self._copy_move_category(src_type, cat_id, "move"))
+        m.add_separator()
+        m.add_command(label="新增子分类", state=lock_state,
+                      command=lambda: self._add_subcategory(cat_id))
+        m.add_command(label="重命名", state=lock_state,
+                      command=lambda: self._rename_category(cat_id))
+        m.add_command(label="删除", state=lock_state,
+                      command=lambda: self._delete_category(cat_id))
         m.tk_popup(event.x_root, event.y_root)
 
+    # ------------------------------------------------------------------ #
+    # 复制到 / 移动到（2026-08-21 第004条新增）
+    # ------------------------------------------------------------------ #
+    def _copy_move_domain(self, domain_id: int, action: str) -> None:
+        """根目录"复制到/移动到"：目标为另一根目录下（作其一级分类）"""
+        if self._lock_on:  # 2026-08-21（第006条修正）：锁定时仅可查询和复制详情内容，"复制到"同样禁止
+            return
+        d = self.db.get_domain(domain_id)
+        if not d:
+            return
+        dlg = CopyMoveDialog(self, self.db, "domain", domain_id, d["name"], action)
+        self.wait_window(dlg)
+        if dlg.result != "ok":
+            return
+        try:
+            if action == "copy":
+                self.db.copy_domain_to_domain(domain_id, dlg.target_id)
+            else:
+                self.db.move_domain_to_domain(domain_id, dlg.target_id)
+        except ValueError as e:
+            messagebox.showwarning("无法操作", str(e), parent=self)
+            return
+        self._after_copy_move()
+        self.toast("✅ 已复制" if action == "copy" else "✅ 已移动")
+
+    def _copy_move_category(self, src_type: str, cat_id: int, action: str) -> None:
+        """一级/二级分类"复制到/移动到"（目标：新建根目录项/某根目录下/某一级分类下）"""
+        if self._lock_on:  # 2026-08-21（第006条修正）：锁定时仅可查询和复制详情内容，"复制到"同样禁止
+            return
+        cat = self.db.get_category(cat_id)
+        if not cat:
+            return
+        dlg = CopyMoveDialog(self, self.db, src_type, cat_id, cat["name"], action,
+                             from_domain_id=self._cur_domain_id)
+        self.wait_window(dlg)
+        if dlg.result != "ok":
+            return
+        try:
+            if dlg.target_kind == "l1_to_domain":
+                if action == "copy":
+                    self.db.copy_l1_to_domain(cat_id, dlg.target_id, dlg.new_name)
+                else:
+                    self.db.move_l1_to_domain(cat_id, self._cur_domain_id,
+                                              dlg.target_id, dlg.new_name)
+            elif dlg.target_kind == "l1_to_l2":
+                if action == "copy":
+                    self.db.copy_l1_to_l2(cat_id, dlg.target_id)
+                else:
+                    self.db.move_l1_to_l2(cat_id, dlg.target_id)
+            elif dlg.target_kind == "l2_to_domain":
+                if action == "copy":
+                    self.db.copy_l2_to_domain(cat_id, dlg.target_id, dlg.new_name)
+                else:
+                    self.db.move_l2_to_domain(cat_id, dlg.target_id, dlg.new_name)
+            elif dlg.target_kind == "l2_to_l2":
+                if action == "copy":
+                    self.db.copy_l2_to_l2(cat_id, dlg.target_id)
+                else:
+                    self.db.move_l2_to_l2(cat_id, dlg.target_id)
+        except ValueError as e:
+            messagebox.showwarning("无法操作", str(e), parent=self)
+            return
+        self._after_copy_move()
+        self.toast("✅ 已复制" if action == "copy" else "✅ 已移动")
+
+    def _after_copy_move(self) -> None:
+        """复制/移动完成后刷新导航与详情（结构性变化，静默重建并复位，避免未保存确认中断）"""
+        self.refresh_domains(silent=True)
+        self._show_detail(None)
+        self._cur_cat_id = None
+        if self._cur_domain_id:
+            self._view = ("domain", self._cur_domain_id)
+
     def _add_domain(self) -> None:
+        if self._lock_on:  # 2026-08-21（第005条）：锁定时禁止新增
+            return
         name = simpledialog.askstring("新增根目录", "请输入根目录名称：", parent=self)
         if name and name.strip():
             self.db.add_domain(name.strip())
             self.refresh_domains()
 
     def _rename_domain(self, domain_id: int) -> None:
+        if self._lock_on:  # 2026-08-21（第005条）：锁定时禁止重命名
+            return
         cur = self.db.get_domain(domain_id)
         name = simpledialog.askstring("重命名根目录", "请输入新名称：",
                                       initialvalue=cur["name"], parent=self)
@@ -1238,6 +1386,8 @@ class MainWindow(ctk.CTk):
 
     def _add_subcategory(self, parent_id: int) -> None:
         """右键"新增子分类"：在当前分类下新建子分类（分类为全局共享树，无需领域）"""
+        if self._lock_on:  # 2026-08-21（第005条）：锁定时禁止新增
+            return
         name = simpledialog.askstring("新增子分类", "请输入分类名称：", parent=self)
         if not (name and name.strip()):
             return
@@ -1245,6 +1395,8 @@ class MainWindow(ctk.CTk):
         self._refresh_l2()
 
     def _rename_category(self, cat_id: int) -> None:
+        if self._lock_on:  # 2026-08-21（第005条）：锁定时禁止重命名
+            return
         cur = self.db.get_category(cat_id)
         name = simpledialog.askstring("重命名分类", "请输入新名称：",
                                       initialvalue=cur["name"], parent=self)
@@ -1282,6 +1434,8 @@ class MainWindow(ctk.CTk):
         return self._cur_cat_id
 
     def _import_json(self) -> None:
+        if self._lock_on:  # 2026-08-21（第005条）：锁定时禁止导入（导入=新增数据）
+            return
         path = filedialog.askopenfilename(title="选择 JSON 备份", parent=self,
                                           filetypes=[("JSON", "*.json")])
         if not path:
@@ -1304,6 +1458,8 @@ class MainWindow(ctk.CTk):
             dlg.finish()
 
     def _import_excel(self) -> None:
+        if self._lock_on:  # 2026-08-21（第005条）：锁定时禁止导入（导入=新增数据）
+            return
         path = filedialog.askopenfilename(title="选择 Excel 文件", parent=self,
                                           filetypes=[("Excel", "*.xlsx")])
         if not path:
@@ -1337,6 +1493,8 @@ class MainWindow(ctk.CTk):
         return msg
 
     def _import_md(self) -> None:
+        if self._lock_on:  # 2026-08-21（第005条）：锁定时禁止导入（导入=新增数据）
+            return
         path = filedialog.askopenfilename(
             title="选择 Markdown 手册", parent=self,
             filetypes=[("Markdown", "*.md *.markdown"), ("所有文件", "*.*")])
@@ -1421,6 +1579,8 @@ class MainWindow(ctk.CTk):
     # 其他：快捷新建、轻提示、热键
     # ------------------------------------------------------------------ #
     def _quick_add(self) -> None:
+        if self._lock_on:  # 2026-08-21（第005条）：锁定时禁止快速新建（新增条目）
+            return
         QuickAddWindow(self, self.db)
 
     def toast(self, msg: str, color: str = "#2E8B57") -> None:

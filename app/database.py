@@ -538,6 +538,399 @@ class Database:
         self.conn.commit()
 
     # ------------------------------------------------------------------ #
+    # 复制/移动分类子树（2026-08-21 第004条新增：各级目录"复制到/移动到"）
+    # 语义（经用户两轮确认，见 20260821_PromptSprite_04 开发工作记录 第003条）：
+    #   - 复制 = 多重关联 / 新建改名副本（源保留）；移动 = 调整关联 / 改名重挂载 + 删除源
+    #   - 级别永不改变（平铺子级保持原级别，不产生三级）；下移加前缀、上移去前缀、重名加序号
+    # ------------------------------------------------------------------ #
+    def unlink_domain_category(self, domain_id: int, category_id: int) -> None:
+        """解除 根目录↔一级分类 关联（移动=调整关联关系）"""
+        self.conn.execute(
+            "DELETE FROM domain_category WHERE domain_id = ? AND category_id = ?",
+            (domain_id, category_id),
+        )
+        self.conn.commit()
+
+    @staticmethod
+    def strip_prefix(name: str) -> str:
+        """上移去前缀：去掉最左侧 'xxx.' 前缀段（对话框默认值，用户可编辑）"""
+        return name.split(".", 1)[1] if "." in name else name
+
+    def _next_domain_order_tx(self) -> int:
+        """事务内：取下一个根目录排序号（不 commit）"""
+        return self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM domains"
+        ).fetchone()[0]
+
+    def _domain_name_exists(self, name: str) -> bool:
+        row = self.conn.execute("SELECT 1 FROM domains WHERE name = ? LIMIT 1", (name,)).fetchone()
+        return row is not None
+
+    def unique_domain_name(self, name: str) -> str:
+        """新建根目录名去重（name → name(2) → ...；domains.name 有 UNIQUE 约束）"""
+        if not self._domain_name_exists(name):
+            return name
+        i = 2
+        while self._domain_name_exists(f"{name}({i})"):
+            i += 1
+        return f"{name}({i})"
+
+    def category_name_exists(self, name: str, parent_id: Optional[int] = None,
+                             domain_id: Optional[int] = None) -> bool:
+        """检测分类名在目标位置是否已存在：
+        - parent_id 非空 → 该父级下的子分类；
+        - parent_id 为空且 domain_id 非空 → 该根目录关联的一级分类。
+        """
+        if parent_id is not None:
+            row = self.conn.execute(
+                "SELECT 1 FROM categories WHERE parent_id = ? AND name = ? LIMIT 1",
+                (parent_id, name),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT 1 FROM categories c JOIN domain_category dc ON dc.category_id = c.id "
+                "WHERE dc.domain_id = ? AND c.parent_id IS NULL AND c.name = ? LIMIT 1",
+                (domain_id, name),
+            ).fetchone()
+        return row is not None
+
+    def unique_category_name(self, name: str, parent_id: Optional[int] = None,
+                             domain_id: Optional[int] = None) -> str:
+        """目标位置下分类名自动加序号：name → name(2) → name(3) ..."""
+        if not self.category_name_exists(name, parent_id=parent_id, domain_id=domain_id):
+            return name
+        i = 2
+        while self.category_name_exists(f"{name}({i})", parent_id=parent_id, domain_id=domain_id):
+            i += 1
+        return f"{name}({i})"
+
+    def _insert_category_tx(self, parent_id: Optional[int], name: str,
+                            new_domain_id: Optional[int] = None) -> int:
+        """事务内新建分类（不 commit）；parent_id=None 且给 new_domain_id 时建立根目录关联"""
+        order = self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM categories WHERE parent_id IS ?",
+            (parent_id,),
+        ).fetchone()[0]
+        cur = self.conn.execute(
+            "INSERT INTO categories(parent_id, name, sort_order) VALUES(?, ?, ?)",
+            (parent_id, name, order),
+        )
+        cid = cur.lastrowid
+        if parent_id is None and new_domain_id is not None:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO domain_category(domain_id, category_id) VALUES(?, ?)",
+                (new_domain_id, cid),
+            )
+        return cid
+
+    def _copy_subtree_tx(self, src_id: int, new_parent_id: Optional[int], new_name: str,
+                         new_domain_id: Optional[int] = None) -> int:
+        """事务内深拷贝分类子树（含条目；条目图片引用同一文件，不 commit）。返回新分类 id"""
+        cid = self._insert_category_tx(new_parent_id, new_name, new_domain_id)
+        ts = _now()
+        for e in self.list_entries(src_id):
+            entry = Entry(**{**e, "id": None, "category_id": cid})
+            self.conn.execute(
+                "INSERT INTO entries(category_id, name, intro, origin, features, scenes, works, "
+                "image_desc, prompt_cn, prompt_en, image_plan, image_path, is_favorite, "
+                "created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (*self._entry_params(entry), ts, ts),
+            )
+        for child in self.list_categories(parent_id=src_id):
+            self._copy_subtree_tx(child["id"], cid, child["name"])
+        return cid
+
+    # ---- 根目录 A → 根目录 B（作 B 的一级分类） ----
+    def move_domain_to_domain(self, domain_id: int, target_domain_id: int) -> dict:
+        """移动根目录 A 到根目录 B 下作为一级分类：
+        1) A 的每个一级分类 C：仅被 A 关联 → 改名 'A.C' 并建立与 B 的关联；
+           被多根目录共享 → 复制改名副本 'A.C' 挂 B 下（原共享分类保留原名）；
+        2) 删除根目录 A。E、F 等二级分类级别与名称不变。
+        """
+        if domain_id == target_domain_id:
+            raise ValueError("不能移动到自身")
+        src = self.get_domain(domain_id)
+        target = self.get_domain(target_domain_id)
+        if not src or not target:
+            raise ValueError("根目录不存在")
+        prefix = src["name"] + "."
+        stats = {"renamed": 0, "copied": 0}
+        try:
+            with self.conn:
+                for l1 in self.list_categories(domain_id=domain_id, parent_id=None):
+                    new_name = self.unique_category_name(prefix + l1["name"],
+                                                         domain_id=target_domain_id)
+                    if len(self.linked_domains(l1["id"])) <= 1:
+                        # 仅被 A 关联：改名 + 建立与 B 的关联
+                        self.conn.execute("UPDATE categories SET name = ? WHERE id = ?",
+                                          (new_name, l1["id"]))
+                        self.conn.execute(
+                            "INSERT OR IGNORE INTO domain_category(domain_id, category_id) "
+                            "VALUES(?, ?)", (target_domain_id, l1["id"]),
+                        )
+                        stats["renamed"] += 1
+                    else:
+                        # 被多根目录共享：复制改名副本，原共享分类保留原名
+                        self._copy_subtree_tx(l1["id"], None, new_name, target_domain_id)
+                        stats["copied"] += 1
+                self.conn.execute("DELETE FROM domains WHERE id = ?", (domain_id,))
+            return stats
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def copy_domain_to_domain(self, domain_id: int, target_domain_id: int) -> dict:
+        """复制根目录 A 到根目录 B 下作为一级分类：为 A 的每个一级分类建改名副本 'A.C' 挂 B 下，A 保留"""
+        if domain_id == target_domain_id:
+            raise ValueError("不能复制到自身")
+        src = self.get_domain(domain_id)
+        target = self.get_domain(target_domain_id)
+        if not src or not target:
+            raise ValueError("根目录不存在")
+        prefix = src["name"] + "."
+        stats = {"copied": 0}
+        try:
+            with self.conn:
+                for l1 in self.list_categories(domain_id=domain_id, parent_id=None):
+                    new_name = self.unique_category_name(prefix + l1["name"],
+                                                         domain_id=target_domain_id)
+                    self._copy_subtree_tx(l1["id"], None, new_name, target_domain_id)
+                    stats["copied"] += 1
+            return stats
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    # ---- 一级分类 C ----
+    def move_l1_to_domain(self, category_id: int, from_domain_id: int,
+                          target_domain_id: Optional[int] = None,
+                          new_name: Optional[str] = None) -> dict:
+        """移动一级分类 C：将 C 的关联关系从 from_domain 调整为 target_domain（同级平移，不改名）；
+        target_domain_id=None → 新建根目录项（默认名去前缀，可传 new_name 指定）。"""
+        cat = self.get_category(category_id)
+        if not cat or cat["parent_id"] is not None:
+            raise ValueError("仅支持一级分类")
+        if target_domain_id is None:
+            new_dom = self.unique_domain_name(new_name or self.strip_prefix(cat["name"]))
+            try:
+                with self.conn:
+                    cur = self.conn.execute(
+                        "INSERT INTO domains(name, sort_order) VALUES(?, ?)",
+                        (new_dom, self._next_domain_order_tx()),
+                    )
+                    target_domain_id = cur.lastrowid
+            except Exception:
+                self.conn.rollback()
+                raise
+        if from_domain_id == target_domain_id:
+            raise ValueError("目标根目录与来源相同")
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "DELETE FROM domain_category WHERE domain_id = ? AND category_id = ?",
+                    (from_domain_id, category_id),
+                )
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO domain_category(domain_id, category_id) VALUES(?, ?)",
+                    (target_domain_id, category_id),
+                )
+            return {"domain_id": target_domain_id}
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def copy_l1_to_domain(self, category_id: int,
+                          target_domain_id: Optional[int] = None,
+                          new_name: Optional[str] = None) -> dict:
+        """复制一级分类 C 到根目录：多重关联（目标根目录建立关联，保留原关联）；
+        target_domain_id=None → 新建根目录项（默认名去前缀，可传 new_name 指定）。"""
+        cat = self.get_category(category_id)
+        if not cat or cat["parent_id"] is not None:
+            raise ValueError("仅支持一级分类")
+        if target_domain_id is None:
+            new_dom = self.unique_domain_name(new_name or self.strip_prefix(cat["name"]))
+            try:
+                with self.conn:
+                    cur = self.conn.execute(
+                        "INSERT INTO domains(name, sort_order) VALUES(?, ?)",
+                        (new_dom, self._next_domain_order_tx()),
+                    )
+                    target_domain_id = cur.lastrowid
+            except Exception:
+                self.conn.rollback()
+                raise
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO domain_category(domain_id, category_id) VALUES(?, ?)",
+                    (target_domain_id, category_id),
+                )
+            return {"domain_id": target_domain_id}
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def move_l1_to_l2(self, category_id: int, target_l1_id: int) -> dict:
+        """移动一级分类 C 到一级分类 D 下作二级：C 的直接子级改名加前缀(C.)并挂到 D 下（级别不变），删除 C"""
+        src = self.get_category(category_id)
+        target = self.get_category(target_l1_id)
+        if not src or src["parent_id"] is not None:
+            raise ValueError("仅支持一级分类")
+        if not target or target["parent_id"] is not None:
+            raise ValueError("目标必须是一级分类")
+        if category_id == target_l1_id:
+            raise ValueError("不能移动到自身")
+        prefix = src["name"] + "."
+        stats = {"children": 0}
+        try:
+            with self.conn:
+                for child in self.list_categories(parent_id=category_id):
+                    new_name = self.unique_category_name(prefix + child["name"],
+                                                         parent_id=target_l1_id)
+                    self.conn.execute("UPDATE categories SET name = ?, parent_id = ? WHERE id = ?",
+                                      (new_name, target_l1_id, child["id"]))
+                    stats["children"] += 1
+                # 2026-08-21（第005条修复）：源一级分类直接挂载的条目先迁移到目标一级分类下，
+                # 避免删除源分类时因外键 ON DELETE SET NULL 转入未分类（复制/移动不删除条目）
+                self.conn.execute(
+                    "UPDATE entries SET category_id = ?, updated_at = ? WHERE category_id = ?",
+                    (target_l1_id, _now(), category_id),
+                )
+                # 源一级分类已无子级，安全删除（其根目录关联级联清理）
+                self.conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+            return stats
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def copy_l1_to_l2(self, category_id: int, target_l1_id: int) -> dict:
+        """复制一级分类 C 到一级分类 D 下作二级：C 的直接子级复制改名副本(C.)挂 D 下，C 保留"""
+        src = self.get_category(category_id)
+        target = self.get_category(target_l1_id)
+        if not src or src["parent_id"] is not None:
+            raise ValueError("仅支持一级分类")
+        if not target or target["parent_id"] is not None:
+            raise ValueError("目标必须是一级分类")
+        if category_id == target_l1_id:
+            raise ValueError("不能复制到自身")
+        prefix = src["name"] + "."
+        stats = {"children": 0}
+        try:
+            with self.conn:
+                for child in self.list_categories(parent_id=category_id):
+                    new_name = self.unique_category_name(prefix + child["name"],
+                                                         parent_id=target_l1_id)
+                    self._copy_subtree_tx(child["id"], target_l1_id, new_name)
+                    stats["children"] += 1
+            return stats
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    # ---- 二级分类 E ----
+    def move_l2_to_domain(self, category_id: int,
+                          target_domain_id: Optional[int] = None) -> dict:
+        """移动二级分类 E 到根目录下作一级：E 提升为一级（parent 置空）并关联目标根目录；
+        target_domain_id=None → 新建根目录项（默认名去前缀）。"""
+        cat = self.get_category(category_id)
+        if not cat or cat["parent_id"] is None:
+            raise ValueError("仅支持二级分类")
+        if target_domain_id is None:
+            new_dom = self.unique_domain_name(self.strip_prefix(cat["name"]))
+            try:
+                with self.conn:
+                    cur = self.conn.execute(
+                        "INSERT INTO domains(name, sort_order) VALUES(?, ?)",
+                        (new_dom, self._next_domain_order_tx()),
+                    )
+                    target_domain_id = cur.lastrowid
+            except Exception:
+                self.conn.rollback()
+                raise
+        try:
+            with self.conn:
+                self.conn.execute("UPDATE categories SET parent_id = NULL WHERE id = ?",
+                                  (category_id,))
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO domain_category(domain_id, category_id) VALUES(?, ?)",
+                    (target_domain_id, category_id),
+                )
+            return {"domain_id": target_domain_id}
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def copy_l2_to_domain(self, category_id: int,
+                          target_domain_id: Optional[int] = None,
+                          new_name: Optional[str] = None) -> dict:
+        """复制二级分类 E 到根目录下作一级：建改名副本（默认去前缀）提升为一级并关联目标根目录；E 保留"""
+        cat = self.get_category(category_id)
+        if not cat or cat["parent_id"] is None:
+            raise ValueError("仅支持二级分类")
+        base = new_name or self.strip_prefix(cat["name"])
+        if target_domain_id is not None:
+            new_name = self.unique_category_name(base, domain_id=target_domain_id)
+        else:
+            new_name = base
+        if target_domain_id is None:
+            new_dom = self.unique_domain_name(new_name)
+            try:
+                with self.conn:
+                    cur = self.conn.execute(
+                        "INSERT INTO domains(name, sort_order) VALUES(?, ?)",
+                        (new_dom, self._next_domain_order_tx()),
+                    )
+                    target_domain_id = cur.lastrowid
+            except Exception:
+                self.conn.rollback()
+                raise
+        try:
+            with self.conn:
+                new_cat_id = self._copy_subtree_tx(category_id, None, new_name, target_domain_id)
+            return {"category_id": new_cat_id, "domain_id": target_domain_id}
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def move_l2_to_l2(self, category_id: int, target_l1_id: int) -> dict:
+        """移动二级分类 E 到一级分类 D 下作二级：同级平移（parent 改 D，名称不变）"""
+        cat = self.get_category(category_id)
+        if not cat or cat["parent_id"] is None:
+            raise ValueError("仅支持二级分类")
+        target = self.get_category(target_l1_id)
+        if not target or target["parent_id"] is not None:
+            raise ValueError("目标必须是一级分类")
+        if cat["parent_id"] == target_l1_id:
+            raise ValueError("目标与当前父级相同")
+        try:
+            with self.conn:
+                self.conn.execute("UPDATE categories SET parent_id = ? WHERE id = ?",
+                                  (target_l1_id, category_id))
+            return {}
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def copy_l2_to_l2(self, category_id: int, target_l1_id: int) -> dict:
+        """复制二级分类 E 到一级分类 D 下作二级：建副本挂 D 下（重名自动加序号），E 保留"""
+        cat = self.get_category(category_id)
+        if not cat or cat["parent_id"] is None:
+            raise ValueError("仅支持二级分类")
+        target = self.get_category(target_l1_id)
+        if not target or target["parent_id"] is not None:
+            raise ValueError("目标必须是一级分类")
+        if cat["parent_id"] == target_l1_id:
+            raise ValueError("目标与当前父级相同")
+        new_name = self.unique_category_name(cat["name"], parent_id=target_l1_id)
+        try:
+            with self.conn:
+                new_cat_id = self._copy_subtree_tx(category_id, target_l1_id, new_name)
+            return {"category_id": new_cat_id}
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    # ------------------------------------------------------------------ #
     # 统计
     # ------------------------------------------------------------------ #
     def stats(self) -> dict:
@@ -663,6 +1056,101 @@ def _selftest() -> None:
         db.set_meta("k", "v")
         assert db.get_meta("k") == "v"
         print("[11] 元信息 通过")
+
+        # 12. 根目录→根目录 移动/复制（2026-08-21 第004条新增）
+        da = db.add_domain("A")
+        dbx = db.add_domain("B")
+        c1 = db.add_category("C", domain_id=da)
+        c2 = db.add_category("D", domain_id=da)
+        e1 = db.add_category("E", parent_id=c1)
+        e2 = db.add_category("F", parent_id=c1)
+        en1 = db.add_entry(Entry(name="EF条目", category_id=e1))
+        # 12.1 移动根目录 A → B：C/D 改名 A.C/A.D 并关联 B，E/F 不变，A 删除
+        db.move_domain_to_domain(da, dbx)
+        assert db.get_domain(da) is None
+        assert db.get_category(c1)["name"] == "A.C"
+        assert db.get_category(c2)["name"] == "A.D"
+        assert db.get_category(c1)["parent_id"] is None
+        assert db.get_category(e1)["name"] == "E" and db.get_category(e1)["parent_id"] == c1
+        assert db.get_category(e2)["name"] == "F"
+        assert db.get_entry(en1)["category_id"] == e1
+        assert any(x["id"] == dbx for x in db.linked_domains(c1))
+        print("[12] 移动根目录→另一根目录(作一级) 通过")
+        # 12.2 复制根目录 B → 新根目录 C：副本名 B.A.C/B.A.D 且带子树条目
+        dc = db.add_domain("C")
+        db.copy_domain_to_domain(dbx, dc)
+        copied = db.list_categories(domain_id=dc, parent_id=None)
+        assert sorted(c["name"] for c in copied) == ["B.A.C", "B.A.D"]
+        b_ac = [c for c in copied if c["name"] == "B.A.C"][0]
+        subs = db.list_categories(parent_id=b_ac["id"])
+        assert sorted(s["name"] for s in subs) == ["E", "F"]
+        assert len(db.list_entries(subs[0]["id"])) == 1
+        print("[13] 复制根目录→新根目录(作一级) 通过")
+        # 12.3 移动一级分类到"新建根目录项"（默认名去前缀，重名加序号）
+        new_d = db.move_l1_to_domain(c1, dbx, None)
+        assert db.get_domain(new_d["domain_id"])["name"] == "C(2)"  # 域"C"已存在
+        assert not any(x["id"] == dbx for x in db.linked_domains(c1))
+        assert any(x["id"] == new_d["domain_id"] for x in db.linked_domains(c1))
+        print("[14] 移动一级分类→新建根目录项 通过")
+        # 12.4 复制一级分类到根目录（多重关联）
+        db.copy_l1_to_domain(c1, dc)
+        ids = [x["id"] for x in db.linked_domains(c1)]
+        assert new_d["domain_id"] in ids and dc in ids
+        print("[15] 复制一级分类→根目录(多重关联) 通过")
+        # 12.5 移动一级分类 → 一级分类下作二级（子级改名加前缀；源直挂条目随迁）
+        l1g = db.add_category("G", domain_id=dbx)
+        l2h = db.add_category("H", parent_id=l1g)
+        l2i = db.add_category("I", parent_id=l1g)
+        en2 = db.add_entry(Entry(name="HI条目", category_id=l2h))
+        en3 = db.add_entry(Entry(name="G直挂条目", category_id=l1g))  # 005 修复验证
+        db.move_l1_to_l2(l1g, b_ac["id"])
+        assert db.get_category(l1g) is None
+        assert db.get_category(l2h)["name"] == "G.H"
+        assert db.get_category(l2h)["parent_id"] == b_ac["id"]
+        assert db.get_category(l2i)["name"] == "G.I"
+        assert db.get_entry(en2)["category_id"] == l2h
+        # 005 修复：源一级分类直接挂载的条目迁移到目标一级分类，不转入未分类
+        assert db.get_entry(en3)["category_id"] == b_ac["id"]
+        assert db.get_entry(en3)["name"] == "G直挂条目"
+        print("[16] 移动一级分类→一级分类下作二级 通过")
+        # 12.6 复制一级分类 → 一级分类下作二级（源保留）
+        l1j = db.add_category("J", domain_id=dc)
+        l2k = db.add_category("K", parent_id=l1j)
+        db.copy_l1_to_l2(l1j, b_ac["id"])
+        assert any(s["name"] == "J.K" for s in db.list_categories(parent_id=b_ac["id"]))
+        assert db.get_category(l1j) is not None and db.get_category(l2k)["parent_id"] == l1j
+        print("[17] 复制一级分类→一级分类下作二级 通过")
+        # 12.7 二级分类 移动/复制
+        e_new = db.move_l2_to_domain(e1, None)  # E 提升为一级 + 新建根目录项(名 E)
+        assert db.get_category(e1)["parent_id"] is None
+        assert db.get_domain(e_new["domain_id"])["name"] == "E"
+        assert any(x["id"] == e_new["domain_id"] for x in db.linked_domains(e1))
+        db.copy_l2_to_l2(e2, b_ac["id"])
+        assert any(s["name"] == "F" for s in db.list_categories(parent_id=b_ac["id"]))
+        assert db.get_category(e2)["parent_id"] == c1
+        db.move_l2_to_l2(e2, b_ac["id"])
+        assert db.get_category(e2)["parent_id"] == b_ac["id"]
+        print("[18] 二级分类 移动/复制 通过")
+        # 12.8 重名自动加序号
+        l2h2 = db.add_category("H", parent_id=l1j)
+        db.copy_l2_to_l2(l2h2, b_ac["id"])
+        db.copy_l2_to_l2(l2h2, b_ac["id"])
+        names = [s["name"] for s in db.list_categories(parent_id=b_ac["id"])]
+        assert names.count("H") == 1 and names.count("H(2)") == 1
+        print("[19] 重名自动加序号 通过")
+        # 12.9 共享一级分类 → 移动根目录时退化为复制副本
+        dom_p = db.add_domain("P")
+        dom_q = db.add_domain("Q")
+        l1m = db.add_category("M", domain_id=dom_p)
+        db.link_domain_category(dom_q, l1m)
+        dom_r = db.add_domain("R")
+        st = db.move_domain_to_domain(dom_p, dom_r)
+        assert st == {"renamed": 0, "copied": 1}
+        assert db.get_category(l1m)["name"] == "M"
+        rm = db.list_categories(domain_id=dom_r, parent_id=None)
+        assert len(rm) == 1 and rm[0]["name"] == "P.M"
+        assert any(x["id"] == dom_q for x in db.linked_domains(l1m))
+        print("[20] 共享分类移动退化为复制 通过")
 
         print(f"[统计] {db.stats()}")
         print("=== 数据库层全部自测通过 ===")
