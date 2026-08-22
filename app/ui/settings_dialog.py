@@ -80,17 +80,25 @@ class SettingsDialog(ctk.CTkToplevel):
                       command=self.destroy).pack(side="left", padx=4)
 
     def _show_about(self) -> None:
-        """关于窗口：显示软件名、版本与简介（2026-08-21 第006条新增）"""
+        """关于窗口：软件名、版本、功能亮点与技术信息（2026-08-22 第008条修订）"""
         win = ctk.CTkToplevel(self)
-        win.title("关于")
+        win.title("关于 PromptSprite")
         win.resizable(False, False)
         win.transient(self)
         win.grab_set()
         info = (
-            f"{config.APP_NAME}（提示精灵）\n\n"
-            f"版本：{config.APP_VERSION}\n\n"
-            "AI 提示词管理工具：四级分类书架 + 极速检索 + 一键复制。\n"
-            "数据全部保存在本机，无任何联网行为。"
+            f"{config.APP_NAME} · 提示精灵\n"
+            f"版本 V{config.APP_VERSION}（2026-08-22 发布）\n"
+            "──────────────────────────\n"
+            "本地优先的 AI 提示词管理工具：\n"
+            "· 四级分类书架（根目录/分类/子分类/条目），极速检索\n"
+            "· 一键复制 / 快速新建 / 全局热键 Ctrl+Shift+P 唤起\n"
+            "· JSON / Excel / Markdown / HTML 多格式导入导出\n"
+            "· 自动备份（保留最近 5 份），数据 100% 本机存储，无任何联网行为\n"
+            "──────────────────────────\n"
+            "技术栈：Python 3.12 · CustomTkinter · SQLite\n"
+            "数据文件：data/prompts.db（随软件目录整体迁移即可换机使用）\n"
+            "© 2026 PromptSprite 开发组 · 仅供学习与个人使用"
         )
         ctk.CTkLabel(win, text=info, font=("Microsoft YaHei", 13),
                      justify="left").pack(padx=24, pady=(20, 8))
