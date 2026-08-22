@@ -113,7 +113,7 @@ PromptSprite/
 │   ├── parser/               # md_parser / json_io / excel_io / html_export
 │   ├── ui/                   # main_window / quick_add / copy_move_dialog / move_selector / progress_dialog / settings_dialog
 │   └── resources/builtin_manual.md   # 内置手册（90 条）
-├── docs/                     # 需求规格V4 / 审核报告V3 / 说明书V3 / 打包指南V3 / 施工方案 / 开发记录
+├── docs/                     # 需求规格V4 / 说明书V3 / 打包指南V3 
 ├── Icons/                    # 应用图标源（PSicon.png）
 ├── *.json / *.xlsx           # 数据资产文件（可直接导入）
 ├── build.py / run.py / requirements.txt / LICENSE / .gitignore
@@ -131,12 +131,9 @@ PromptSprite/
 | 文档 | 说明 |
 | ---- | ---- |
 | [项目需求规格和开发规划设计方案（V4.0）](docs/20260818_PromptSprite项目需求规格和开发规划设计方案_v4.md) | 当前版需求规格与规划 |
-| [项目审核和修改建议报告（V3.0）](docs/20260818_PromptSprite_项目审核和修改建议报告_v3.md) | 六维审核结论与 P2/P3 修改建议 |
 | [软件安装使用说明书（V3.0）](docs/20260818_PromptSprite_软件安装使用说明书_v3.md) | 面向小白的完整使用指南 |
 | [打包发布指南（V3.0）](docs/20260818_PromptSprite_打包发布指南_v3.md) | 打包与 GitHub Releases 发布全流程 |
-| [施工方案（V1.1）](docs/20260812_PromptSprite_施工方案.md) | 原始施工方案与验收清单 |
-| [开发工作记录 01](20260812_PromptSprite_01_开发工作记录.md) | 第 001-021 条开发记录 |
-| [开发工作记录 02](20260818_PromptSprite_02_开发工作记录.md) | 2026-08-18 起新记录卷 |
+
 
 ## 🤝 参与贡献
 
