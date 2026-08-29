@@ -23,6 +23,7 @@ import re  # 2026-08-18（第020条，P2-B2 修复）：import re 由 _open_imag
 import shutil
 import tkinter as tk
 import webbrowser  # 2026-08-18（第015条）：详情"⑩图像获取方案"打开链接按钮
+from datetime import datetime  # 2026-08-29（M4）：增量备份文件名日期
 from tkinter import filedialog, messagebox, simpledialog
 from typing import Optional
 
@@ -37,6 +38,8 @@ from .move_selector import MoveSelector
 from .progress_dialog import ProgressDialog
 from .quick_add import QuickAddWindow
 from .settings_dialog import SettingsDialog  # 2026-08-18："设置"入口
+from ..incremental_backup import (get_computer_code, incr_dir,  # 2026-08-29（M4）：增量备份
+                                  write_incremental, export_incremental_to)
 
 
 # 详情区字段展示配置：(显示名, 数据库字段键, 文本框高度行数)
@@ -124,8 +127,8 @@ class MainWindow(ctk.CTk):
         self.startup_warning = startup_warning
 
         self.title("PromptSprite（提示精灵）")
-        self.geometry("1360x780")
-        self.minsize(1240, 660)
+        self.geometry("1480x780")  # 2026-08-29（M2）：四列导航，默认宽度 1360→1480
+        self.minsize(1360, 660)
 
         # 交互状态
         self._lock_on = False
@@ -147,6 +150,11 @@ class MainWindow(ctk.CTk):
         self._l0_styles = {}        # 根目录列按钮原始配色（恢复高亮用）
         self._l1_styles = {}
         self._l2_styles = {}
+        self._p_btns = {}           # 项目类别列按钮引用（四级分类最高层级，2026-08-29 新增）
+        self._p_styles = {}         # 项目类别列按钮原始配色
+        self._cur_project_id = None  # 当前项目类别 id（None=未分配视图）
+        self._nav_initialized = False  # 首次导航默认选择是否已确定
+        self._project_col_hidden = False  # 2026-08-29：项目类别列是否折叠
         self._toast_label = None
 
         self._load_settings()   # 2026-08-18：应用持久化设置（窗口大小/视图模式/详情策略）
@@ -216,6 +224,10 @@ class MainWindow(ctk.CTk):
         self.lock_btn = ctk.CTkButton(bar, text="🔒 锁定", width=96,
                                       command=self._toggle_lock)
         self.lock_btn.grid(row=0, column=1, padx=4)
+        # 2026-08-22（第007条）：记录锁定按钮默认配色——customtkinter 6.0.0 中
+        # configure(fg_color=None) 会抛 ValueError，解锁时须恢复为记录的默认色
+        self._lock_btn_default_fg = self.lock_btn.cget("fg_color")
+        self._lock_btn_default_hover = self.lock_btn.cget("hover_color")
         ctk.CTkButton(bar, text="📂 未分类", width=96, command=self._show_uncategorized
                       ).grid(row=0, column=2, padx=4)
         ctk.CTkButton(bar, text="⭐ 常用", width=96, command=self._show_favorites
@@ -227,7 +239,10 @@ class MainWindow(ctk.CTk):
 
         # 导入/导出下拉菜单
         self.import_menu = tk.Menu(bar, tearoff=0)
+        self.import_menu.add_command(label="数据迁移向导…", command=self._open_migrate_wizard)  # 2026-08-29（M5）
+        self.import_menu.add_separator()
         self.import_menu.add_command(label="导入 JSON 备份…", command=self._import_json)
+        self.import_menu.add_command(label="导入增量备份…", command=self._import_incremental)  # 2026-08-29（M4）：增量合并恢复
         self.import_menu.add_command(label="导入 Excel…", command=self._import_excel)
         self.import_menu.add_command(label="导入 Markdown 手册…", command=self._import_md)
         self.export_menu = tk.Menu(bar, tearoff=0)
@@ -245,6 +260,13 @@ class MainWindow(ctk.CTk):
                                      command=lambda: self._export_html(current_only=False))
         self.export_menu.add_command(label="导出当前分类 HTML…",
                                      command=lambda: self._export_html(current_only=True))
+        self.export_menu.add_separator()  # 2026-08-29（M4）：增量数据导出
+        self.export_menu.add_command(label="增量数据导出 Excel…",
+                                     command=lambda: self._export_incremental_browse("excel"))
+        self.export_menu.add_command(label="增量数据导出 HTML…",
+                                     command=lambda: self._export_incremental_browse("html"))
+        self.export_menu.add_command(label="导出增量备份文件到…",
+                                     command=self._export_incremental_file_to)
 
         self.import_btn = ctk.CTkButton(bar, text="⇩ 导入", width=88)
         self.import_btn.grid(row=0, column=5, padx=4)
@@ -260,27 +282,33 @@ class MainWindow(ctk.CTk):
         self.quick_add_btn.grid(row=0, column=7, padx=(4, 4))
         ctk.CTkButton(bar, text="⚙ 设置", width=80, command=self._open_settings  # 2026-08-18：设置入口
                       ).grid(row=0, column=8, padx=(4, 14))
+        self.btn_project_toggle = ctk.CTkButton(  # 2026-08-29：项目类别列折叠/展开
+            bar, text="🗂 项目列", width=84, command=self._toggle_project_column)
+        self.btn_project_toggle.grid(row=0, column=9, padx=(4, 14))
 
     def _build_body(self) -> None:
         body = ctk.CTkFrame(self)
         body.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 4))
         body.grid_rowconfigure(0, weight=1)
-        body.grid_columnconfigure(3, weight=1)   # 条目区
-        body.grid_columnconfigure(4, weight=2)   # 详情区
+        body.grid_columnconfigure(4, weight=0)   # 条目区：固定宽度（≤12汉字，2026-08-29 用户要求）
+        body.grid_columnconfigure(5, weight=1)   # 详情区：占据剩余空间
 
-        self.l0_frame = ctk.CTkScrollableFrame(body, width=142, label_text="根目录")  # 2026-08-18（第021条）：宽度 114→142（增加2汉字/4英文字符，1汉字≈14px）
-        self.l1_frame = ctk.CTkScrollableFrame(body, width=228, label_text="一级分类")  # 2026-08-18（第021条）：宽度 242→228（减小1汉字/2英文字符）
-        self.l2_frame = ctk.CTkScrollableFrame(body, width=202, label_text="二级分类")
-        self.entry_frame = ctk.CTkScrollableFrame(body, width=304, label_text="条目")  # 2026-08-18：宽度 360→304（缩减4汉字/8英文字符）
+        # 2026-08-29 用户要求列宽：1汉字≈14px；项目类别/根目录 ≤8汉字(112px)，一级/二级/条目 ≤12汉字(168px)
+        self.project_frame = ctk.CTkScrollableFrame(body, width=112, label_text="项目类别")
+        self.l0_frame = ctk.CTkScrollableFrame(body, width=112, label_text="根目录")
+        self.l1_frame = ctk.CTkScrollableFrame(body, width=168, label_text="一级分类")
+        self.l2_frame = ctk.CTkScrollableFrame(body, width=168, label_text="二级分类")
+        self.entry_frame = ctk.CTkScrollableFrame(body, width=168, label_text="条目")
 
-        self.l0_frame.grid(row=0, column=0, sticky="nsew")
-        self.l1_frame.grid(row=0, column=1, sticky="nsew")
-        self.l2_frame.grid(row=0, column=2, sticky="nsew")
-        self.entry_frame.grid(row=0, column=3, sticky="nsew")
+        self.project_frame.grid(row=0, column=0, sticky="nsew")
+        self.l0_frame.grid(row=0, column=1, sticky="nsew")
+        self.l1_frame.grid(row=0, column=2, sticky="nsew")
+        self.l2_frame.grid(row=0, column=3, sticky="nsew")
+        self.entry_frame.grid(row=0, column=4, sticky="nsew")
 
         # 详情区：固定头部（名称/收藏/删除/复制/保存按钮）+ 滚动内容区
         self.detail_root = ctk.CTkFrame(body)
-        self.detail_root.grid(row=0, column=4, sticky="nsew")
+        self.detail_root.grid(row=0, column=5, sticky="nsew")
         self.detail_root.grid_rowconfigure(1, weight=1)
         self.detail_root.grid_columnconfigure(0, weight=1)
 
@@ -326,8 +354,8 @@ class MainWindow(ctk.CTk):
     # 状态栏统计（2026-08-18 第017条：按鼠标悬停层级动态显示）
     # ------------------------------------------------------------------ #
     def _cat_entry_count(self, cat_id: int) -> int:
-        """分类及其全部子分类下的条目总数（直挂 + 子树递归）"""
-        total = len(self.db.list_entries(cat_id))
+        """分类及其全部子分类下的条目总数（直挂 + 子树递归；2026-08-29 复审优化：COUNT 不加载行）"""
+        total = self.db.count_entries(cat_id)
         for sub in self.db.list_categories(parent_id=cat_id):
             total += self._cat_entry_count(sub["id"])
         return total
@@ -340,31 +368,53 @@ class MainWindow(ctk.CTk):
         return total
 
     def _status_default(self) -> None:
-        """无选择状态：总提示词数 / 一级目录数 / 二级目录数 / 条目数"""
-        total = len(self.db.list_all_entries())
+        """无选择状态：总提示词数 / 项目类别 / 根目录 / 一级 / 二级目录数"""
+        total = self.db.stats()["entries"]  # 2026-08-29（B5 修复）：COUNT 取代全表加载
+        np_ = len(self.db.list_projects())
+        nd = len(self.db.list_domains())
         l1 = len(self.db.list_categories(parent_id=None))
         l2 = 0
         for c in self.db.list_categories(parent_id=None):
             l2 += len(self.db.list_categories(parent_id=c["id"]))
         self.status_label.configure(
-            text=f"总提示词数 {total}｜一级目录 {l1}｜二级目录 {l2}｜条目数 {total}")
+            text=f"总提示词数 {total}｜项目类别 {np_}｜根目录 {nd}｜一级目录 {l1}｜二级目录 {l2}")
+
+    def _status_hover_project(self, project_id: Optional[int]) -> None:
+        """悬停项目类别：项目名 + 根目录数 + 提示词总数（"未分配"显示无归属统计）"""
+        total = self.db.stats()["entries"]  # 2026-08-29（B5 修复）：COUNT 取代全表加载
+        if project_id is None:
+            domains = self.db.list_unassigned_domains()
+            name = "未分配"
+        else:
+            p = self.db.get_project(project_id)
+            if not p:
+                return
+            name = p["name"]
+            domains = self.db.list_domains(project_id=project_id)
+        n = sum(self._domain_entry_count(d["id"]) for d in domains)
+        self.status_label.configure(
+            text=f"总提示词数 {total}｜项目【{name}】根目录 {len(domains)} 个｜提示词 {n}")
 
     def _status_hover_domain(self, domain_id: int) -> None:
-        """悬停根目录：总提示词数 + 当前根目录名称和该项下提示词总数"""
+        """悬停根目录：总提示词数 + 当前根目录名称和该项下提示词总数 + 所属项目"""
         d = self.db.get_domain(domain_id)
         if not d:
             return
-        total = len(self.db.list_all_entries())
+        total = self.db.stats()["entries"]  # 2026-08-29（B5 修复）：COUNT 取代全表加载
         n = self._domain_entry_count(domain_id)
+        pname = ""
+        if d.get("project_id"):
+            p = self.db.get_project(d["project_id"])
+            pname = f"｜项目【{p['name']}】" if p else ""
         self.status_label.configure(
-            text=f"总提示词数 {total}｜根目录【{d['name']}】提示词 {n}")
+            text=f"总提示词数 {total}｜根目录【{d['name']}】提示词 {n}{pname}")
 
     def _status_hover_cat(self, cat_id: int) -> None:
         """悬停一级/二级分类：所属根目录 + 一级（+二级）统计"""
         cat = self.db.get_category(cat_id)
         if not cat:
             return
-        total = len(self.db.list_all_entries())
+        total = self.db.stats()["entries"]  # 2026-08-29（B5 修复）：COUNT 取代全表加载
         root = self.db.category_root(cat_id)          # 一级分类 id（category_root 返回 id）
         doms = self.db.linked_domains(root) if root else []
         dom_name = doms[0]["name"] if doms else ""
@@ -380,7 +430,7 @@ class MainWindow(ctk.CTk):
 
     def _status_hover_entry(self, e: dict) -> None:
         """悬停条目：链路统计（根目录/一级/二级）+ 本条目的名称"""
-        total = len(self.db.list_all_entries())
+        total = self.db.stats()["entries"]  # 2026-08-29（B5 修复）：COUNT 取代全表加载
         cat_id = e.get("category_id")
         name = (e.get("name") or "").strip()
         if not cat_id:                                 # 未分类条目
@@ -426,13 +476,15 @@ class MainWindow(ctk.CTk):
     # 根目录 / 分类导航
     # ------------------------------------------------------------------ #
     def refresh_domains(self, silent: bool = False) -> None:
-        """（重）渲染三列导航并复位。
+        """（重）渲染四列导航并复位。
 
         silent=True（2026-08-18，P1-2 修复）：跳过"未保存修改"检查、保留详情区当前状态，
         供快捷新建保存后调用，避免弹出未保存确认框打断连续录入。
         """
         if not silent and not self._confirm_unsaved():
             return
+        self._ensure_default_project()
+        self._refresh_projects()
         self._refresh_l0()
         self._refresh_l1()
         self._clear_frame(self.l2_frame)
@@ -441,9 +493,25 @@ class MainWindow(ctk.CTk):
         if not silent:
             self._show_detail(None)
 
+    def _ensure_default_project(self) -> None:
+        """首次导航默认选择：存在未分配根目录则停留"未分配"视图，否则选中第一个项目类别"""
+        if self._nav_initialized:
+            return
+        self._nav_initialized = True
+        if self.db.list_unassigned_domains():
+            self._cur_project_id = None
+            self._view = ("project", None)
+        else:
+            projects = self.db.list_projects()
+            if projects:
+                self._cur_project_id = projects[0]["id"]
+                self._view = ("project", self._cur_project_id)
+
     # ---- 导航按钮引用（选中高亮原地更新，不销毁重建，杜绝悬停闪烁） ----
     def _clear_nav_btns(self, col: str) -> None:
-        if col == "l0":
+        if col == "p":
+            self._p_btns, self._p_styles = {}, {}
+        elif col == "l0":
             self._l0_btns, self._l0_styles = {}, {}
         elif col == "l1":
             self._l1_btns, self._l1_styles = {}, {}
@@ -465,9 +533,11 @@ class MainWindow(ctk.CTk):
             btn.configure(fg_color=fg, hover_color=hover, text_color=text)
 
     def _apply_nav_highlight(self) -> None:
-        """原地更新三列选中高亮"""
+        """原地更新四列选中高亮"""
         l1_sel = self._l1_highlight_id()
         l2_sel = self._l2_highlight_id()
+        for pid, btn in self._p_btns.items():
+            self._style_nav_btn(btn, pid == self._cur_project_id, self._p_styles.get(pid))
         for cid, btn in self._l0_btns.items():
             self._style_nav_btn(btn, cid == self._cur_domain_id, self._l0_styles.get(cid))
         for cid, btn in self._l1_btns.items():
@@ -475,14 +545,176 @@ class MainWindow(ctk.CTk):
         for cid, btn in self._l2_btns.items():
             self._style_nav_btn(btn, cid == l2_sel, self._l2_styles.get(cid))
 
+    @staticmethod
+    def _attach_nav_tooltip(btn, name: str, budget: int) -> None:
+        """长名称悬停提示：名称长度超过列宽预算时附加 tooltip（2026-08-29 UI 优化）。
+        budget：该列可显示的大致汉字数（项目/根目录≈8，一级/二级/条目≈12）。
+        """
+        if len(name) > budget:
+            _FieldTooltip(btn, name)
+
+    # ------------------------------------------------------------------ #
+    # 项目类别（四级分类最高层级，2026-08-29 M2 新增）
+    # ------------------------------------------------------------------ #
+    def _refresh_projects(self) -> None:
+        """渲染项目类别列（含"新增"按钮、"未分配"虚拟项）"""
+        self._clear_frame(self.project_frame)
+        self._clear_nav_btns("p")
+        ctk.CTkButton(self.project_frame, text="➕ 新增项目类别", height=30, **_ADD_BTN,
+                      state="disabled" if self._lock_on else "normal",
+                      command=self._add_project).pack(fill="x", padx=6, pady=3)
+        for p in self.db.list_projects():
+            btn = ctk.CTkButton(self.project_frame, text=p["name"], anchor="w", height=32,
+                                command=lambda pid=p["id"]: self._select_project(pid))
+            btn.pack(fill="x", padx=6, pady=2)
+            self._p_btns[p["id"]] = btn
+            self._p_styles[p["id"]] = (btn.cget("fg_color"), btn.cget("hover_color"),
+                                        btn.cget("text_color"))
+            btn.bind("<Button-3>",
+                     lambda e, pid=p["id"], n=p["name"]: self._project_menu(e, pid, n))
+            btn.bind("<Enter>",
+                     lambda _e, pid=p["id"]: (self._schedule_select(
+                         _HOVER_SELECT_MS, lambda: self._select_project(pid)),
+                         self._status_hover_project(pid)))
+            btn.bind("<Leave>", lambda _e: (self._cancel_select(),
+                                            self._status_default()))
+            self._attach_nav_tooltip(btn, p["name"], 6)  # 2026-08-29：长名称悬停提示
+        # "未分配"虚拟项（存在无归属根目录时显示）
+        if self.db.list_unassigned_domains():
+            btn = ctk.CTkButton(self.project_frame, text="🗂 未分配", anchor="w", height=32,
+                                command=lambda: self._select_project(None))
+            btn.pack(fill="x", padx=6, pady=2)
+            self._p_btns[None] = btn
+            self._p_styles[None] = (btn.cget("fg_color"), btn.cget("hover_color"),
+                                    btn.cget("text_color"))
+            btn.bind("<Button-3>", lambda e: self._project_menu(e, None, "未分配"))
+            btn.bind("<Enter>", lambda _e: (self._schedule_select(
+                _HOVER_SELECT_MS, lambda: self._select_project(None)),
+                self._status_hover_project(None)))
+            btn.bind("<Leave>", lambda _e: (self._cancel_select(),
+                                            self._status_default()))
+        self._apply_nav_highlight()
+
+    def _select_project(self, project_id: Optional[int]) -> None:
+        """选择项目类别（None=未分配视图）：重建根目录/分类/条目列"""
+        if self._cur_project_id == project_id and self._cur_domain_id is None:
+            return
+        self._cur_project_id = project_id
+        self._cur_domain_id = None
+        self._cur_cat_id = None
+        self._view = ("project", project_id)
+        self._refresh_projects()   # 原地高亮
+        self._refresh_l0()
+        self._refresh_l1()
+        self._clear_frame(self.l2_frame)
+        self._clear_nav_btns("l2")
+        self._render_entries([], "条目")
+
+    def _toggle_project_column(self) -> None:
+        """折叠/展开项目类别列（2026-08-29 UI 优化）"""
+        if self._project_col_hidden:
+            self.project_frame.grid(row=0, column=0, sticky="nsew")
+            self._project_col_hidden = False
+            self.btn_project_toggle.configure(text="🗂 项目列")
+        else:
+            self.project_frame.grid_remove()
+            self._project_col_hidden = True
+            self.btn_project_toggle.configure(text="📄 展开项目")
+
+    def _project_menu(self, event, project_id: Optional[int], name: str) -> None:
+        lock_state = "disabled" if self._lock_on else "normal"
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="新增项目类别", state=lock_state, command=self._add_project)
+        if project_id is not None:
+            m.add_command(label="重命名", state=lock_state,
+                          command=lambda: self._rename_project(project_id))
+            m.add_command(label="删除", state=lock_state,
+                          command=lambda: self._delete_project(project_id))
+        m.tk_popup(event.x_root, event.y_root)
+
+    def _add_project(self) -> None:
+        if self._lock_on:
+            return
+        name = simpledialog.askstring("新增项目类别", "请输入项目类别名称：", parent=self)
+        if name and name.strip():
+            pid = self.db.add_project(name.strip())
+            self._select_project(pid)
+            self.toast("✅ 已新增项目类别")
+
+    def _rename_project(self, project_id: int) -> None:
+        if self._lock_on:
+            return
+        p = self.db.get_project(project_id)
+        if not p:
+            return
+        name = simpledialog.askstring("重命名项目类别", "请输入新名称：",
+                                      initialvalue=p["name"], parent=self)
+        if name and name.strip() and name.strip() != p["name"]:
+            self.db.rename_project(project_id, name.strip())
+            self._refresh_projects()
+            self.toast("✅ 已重命名")
+
+    def _delete_project(self, project_id: int) -> None:
+        if self._lock_on:
+            return
+        p = self.db.get_project(project_id)
+        if not p:
+            return
+        n = self.db.count_project_domains(project_id)
+        if not messagebox.askyesno("删除确认",
+                                   f"⚠️ 确定要删除项目类别【{p['name']}】吗？"):
+            return
+        fallback = self.db.ensure_project(config.PROJECT_FALLBACK)
+        if n:
+            if not messagebox.askyesno(
+                    "根目录迁移",
+                    f"该项目下 {n} 个根目录将移动到【{config.PROJECT_FALLBACK}】，继续？"):
+                return
+        self.db.delete_project(project_id, fallback_project_id=fallback)
+        if self._cur_project_id == project_id:
+            self._cur_project_id = None
+        self._refresh_projects()
+        self._refresh_l0()
+        self.toast("已删除项目类别")
+
+    def _choose_project(self, title: str, message: str,
+                        include_unassigned: bool = False):
+        """弹窗选择一个项目类别；选中返回 (True, pid)，取消返回 None。
+        include_unassigned=True 时提供"🗂 未分配"选项（pid 为 None 表示清除归属）。
+        2026-08-29：抽取到公共模块 project_chooser 复用（冗余优化）。
+        """
+        if not self.db.list_projects():
+            self.toast("暂无项目类别", color="#D9534F")
+            return None
+        from .project_chooser import choose_project
+        return choose_project(self, self.db, title, message, include_unassigned)
+
+    def _move_domain_to_project(self, domain_id: int) -> None:
+        """根目录 → 其他项目类别（快捷移动；"复制到"走 M3 的复制/移动对话框）"""
+        if self._lock_on:
+            return
+        d = self.db.get_domain(domain_id)
+        if not d:
+            return
+        r = self._choose_project("移动到项目类别", f"【{d['name']}】移动到：",
+                                 include_unassigned=True)
+        if r is None:
+            return
+        self.db.move_domain_to_project(domain_id, r[1])
+        self._refresh_projects()
+        self._refresh_l0()
+        self.toast("✅ 已移动")
+
     def _refresh_l0(self) -> None:
-        """渲染根目录列（记录按钮引用，末尾统一应用高亮）"""
+        """渲染根目录列（当前项目类别下；"未分配"视图显示无归属根目录）"""
         self._clear_frame(self.l0_frame)
         self._clear_nav_btns("l0")
         ctk.CTkButton(self.l0_frame, text="➕ 新增根目录", height=30, **_ADD_BTN,
                       state="disabled" if self._lock_on else "normal",  # 2026-08-21（第005条）：锁定时禁用新增
                       command=self._add_domain).pack(fill="x", padx=6, pady=3)
-        for d in self.db.list_domains():
+        domains = (self.db.list_unassigned_domains() if self._cur_project_id is None
+                   else self.db.list_domains(project_id=self._cur_project_id))
+        for d in domains:
             btn = ctk.CTkButton(self.l0_frame, text=d["name"], anchor="w", height=32,
                                 command=lambda did=d["id"]: self._select_domain(did))
             btn.pack(fill="x", padx=6, pady=2)
@@ -497,6 +729,7 @@ class MainWindow(ctk.CTk):
                          self._status_hover_domain(did)))  # 2026-08-18：状态栏显示根目录统计
             btn.bind("<Leave>", lambda _e: (self._cancel_select(),
                                             self._status_default()))  # 2026-08-18：离开恢复默认统计
+            self._attach_nav_tooltip(btn, d["name"], 6)  # 2026-08-29：长名称悬停提示
         self._apply_nav_highlight()
 
     def _select_domain(self, domain_id: int) -> None:
@@ -572,6 +805,7 @@ class MainWindow(ctk.CTk):
                          self._status_hover_cat(cid)))  # 2026-08-18：状态栏显示一级分类统计
             btn.bind("<Leave>", lambda _e: (self._cancel_select(),
                                             self._status_default()))  # 2026-08-18：离开恢复默认统计
+            self._attach_nav_tooltip(btn, c["name"], 10)  # 2026-08-29：长名称悬停提示
         self._apply_nav_highlight()
 
     def _add_l2(self) -> None:
@@ -609,6 +843,7 @@ class MainWindow(ctk.CTk):
                              self._status_hover_cat(cid)))  # 2026-08-18：状态栏显示二级分类统计
                 btn.bind("<Leave>", lambda _e: (self._cancel_select(),
                                                 self._status_default()))  # 2026-08-18：离开恢复默认统计
+                self._attach_nav_tooltip(btn, c["name"], 10)  # 2026-08-29：长名称悬停提示
         self._apply_nav_highlight()
 
     def _select_category(self, cat_id: int) -> None:
@@ -659,7 +894,13 @@ class MainWindow(ctk.CTk):
         if self._view is None:
             return
         kind, ref = self._view
-        if kind == "domain":
+        if kind == "project":
+            self._cur_project_id = ref
+            self._refresh_projects()
+            self._refresh_l0()
+            self._refresh_l1()
+            self._render_entries([], "条目")
+        elif kind == "domain":
             self._refresh_l1()
             self._render_entries([], "条目")
         elif kind == "cat":
@@ -1197,9 +1438,15 @@ class MainWindow(ctk.CTk):
     # ------------------------------------------------------------------ #
     def _toggle_lock(self) -> None:
         self._lock_on = not self._lock_on
-        self.lock_btn.configure(
-            text="🔓 已锁定" if self._lock_on else "🔒 锁定",
-            fg_color="#D9534F" if self._lock_on else None)
+        # 2026-08-22（第007条）：解锁时恢复记录的默认配色（customtkinter 6.0.0
+        # 不接受 fg_color=None，会抛 ValueError 中断本方法导致按钮显示卡死）
+        if self._lock_on:
+            self.lock_btn.configure(text="🔓 已锁定", fg_color="#D9534F")
+        else:
+            self.lock_btn.configure(
+                text="🔒 锁定",
+                fg_color=self._lock_btn_default_fg,
+                hover_color=self._lock_btn_default_hover)
         self._apply_lock_state()
         self.toast("已开启全局锁定，删除功能已禁用" if self._lock_on else "已解除锁定")
 
@@ -1234,8 +1481,12 @@ class MainWindow(ctk.CTk):
                 last = None
             if last is not None:
                 for i in range(last + 1):
-                    self.import_menu.entryconfigure(i, state=state)
-        # 重建新增按钮（l0/l1/l2 的"➕新增…"按锁定置灰）
+                    try:
+                        self.import_menu.entryconfigure(i, state=state)
+                    except tk.TclError:
+                        pass  # 分隔符等不支持 state 的项跳过（2026-08-29 M5：菜单新增分隔符后修复）
+        # 重建新增按钮（p/l0/l1/l2 的"➕新增…"按锁定置灰）
+        self._refresh_projects()
         self._refresh_l0()
         self._refresh_l1()
         self._refresh_l2()
@@ -1251,6 +1502,8 @@ class MainWindow(ctk.CTk):
                       command=lambda: self._copy_move_domain(domain_id, "copy"))
         m.add_command(label="移动到…", state=lock_state,
                       command=lambda: self._copy_move_domain(domain_id, "move"))
+        m.add_command(label="移动到其他项目类别…", state=lock_state,  # 2026-08-29（M2）
+                      command=lambda: self._move_domain_to_project(domain_id))
         m.add_separator()
         m.add_command(label="重命名", state=lock_state,
                       command=lambda: self._rename_domain(domain_id))
@@ -1292,7 +1545,13 @@ class MainWindow(ctk.CTk):
         if dlg.result != "ok":
             return
         try:
-            if action == "copy":
+            if dlg.target_kind == "domain_to_project":  # 2026-08-29（M3）：根目录 → 项目类别
+                if action == "copy":
+                    new_name = self.db.unique_domain_name(d["name"])
+                    self.db.copy_domain_to_project(domain_id, dlg.target_id, new_name)
+                else:
+                    self.db.move_domain_to_project(domain_id, dlg.target_id)
+            elif action == "copy":
                 self.db.copy_domain_to_domain(domain_id, dlg.target_id)
             else:
                 self.db.move_domain_to_domain(domain_id, dlg.target_id)
@@ -1354,9 +1613,16 @@ class MainWindow(ctk.CTk):
         if self._lock_on:  # 2026-08-21（第005条）：锁定时禁止新增
             return
         name = simpledialog.askstring("新增根目录", "请输入根目录名称：", parent=self)
-        if name and name.strip():
-            self.db.add_domain(name.strip())
-            self.refresh_domains()
+        if not (name and name.strip()):
+            return
+        # 决策 5：新增根目录弹窗选择所属项目类别；未选择则默认归入"未明确分类"
+        r = self._choose_project("选择项目类别", f"【{name.strip()}】归属项目类别：")
+        if r is None:
+            project_id = self.db.ensure_project(config.PROJECT_FALLBACK)
+        else:
+            project_id = r[1]
+        self.db.add_domain(name.strip(), project_id=project_id)
+        self.refresh_domains()
 
     def _rename_domain(self, domain_id: int) -> None:
         if self._lock_on:  # 2026-08-21（第005条）：锁定时禁止重命名
@@ -1466,6 +1732,17 @@ class MainWindow(ctk.CTk):
             return
         if not self._confirm_unsaved():
             return
+        # 2026-08-29（P2 修复）：大文件限制（≤20MB），避免内存风险
+        try:
+            if os.path.getsize(path) > 20 * 1024 * 1024:
+                messagebox.showwarning(
+                    "文件过大",
+                    "所选 Excel 文件超过 20MB，请拆分后导入，或改用 JSON 导入。",
+                    parent=self)
+                return
+        except OSError as exc:
+            messagebox.showerror("导入失败", f"文件无法读取：{exc}", parent=self)
+            return
         try:
             total = excel_io.count_excel_rows(path)
         except Exception as exc:
@@ -1483,13 +1760,18 @@ class MainWindow(ctk.CTk):
 
     @staticmethod
     def _import_done_msg(result: dict) -> str:
-        """导入完成提示：新增条数 +（跳过重复条数）。
+        """导入完成提示：新增条数 +（跳过重复条数）+（删除同步统计）。
 
         2026-08-18（P1-1）：新增"跳过重复"统计（详情内容去重）。
+        2026-08-29（增量备份增强）：新增删除同步统计。
         """
         msg = f"✅ 导入完成：新增 {result.get('entries', 0)} 条"
         if result.get("skipped"):
             msg += f"，跳过重复 {result['skipped']} 条"
+        d = result.get("deleted")
+        if d and (d.get("entries") or d.get("categories") or d.get("domains")):
+            msg += (f"，同步删除 条目{d.get('entries', 0)}/"
+                    f"分类{d.get('categories', 0)}/根目录{d.get('domains', 0)}")
         return msg
 
     def _import_md(self) -> None:
@@ -1506,6 +1788,7 @@ class MainWindow(ctk.CTk):
                                         initialvalue="视觉风格分类", parent=self)  # 2026-08-18（P1-1）：默认目标由"视频"改为"视觉风格分类"
         if not domain or not domain.strip():
             return
+        dlg = None  # 2026-08-29（B1 修复）：提前初始化，避免 parse 异常时 finally 触发 NameError
         try:
             manual = md_parser.parse_file(path)
             total = manual.count_entries()
@@ -1522,7 +1805,77 @@ class MainWindow(ctk.CTk):
         except Exception as exc:
             messagebox.showerror("导入失败", str(exc), parent=self)
         finally:
-            dlg.finish()
+            if dlg is not None:  # 2026-08-29（B1 修复）：dlg 可能未创建
+                dlg.finish()
+
+    # ------------------------------------------------------------------ #
+    # 增量备份：导入合并 / 导出浏览（2026-08-29 M4）
+    # ------------------------------------------------------------------ #
+    def _open_migrate_wizard(self) -> None:
+        """打开老版本数据迁移向导（未归属根目录 → 项目类别）"""
+        from .migrate_dialog import MigrateDialog
+        dlg = MigrateDialog(self, self.db)
+        self.wait_window(dlg)
+        if dlg.result == "ok":
+            self.refresh_domains()
+            self.toast("✅ 迁移完成")
+        else:
+            self.db.set_meta(config.META_MIGRATE_WIZARD_DISMISSED, "1")
+            self.refresh_domains(silent=True)
+
+    def _import_incremental(self) -> None:
+        """导入增量备份 JSON（v3）合并到当前库（复用 JSON 导入内容判重）"""
+        self._import_json()
+
+    def _export_incremental_browse(self, fmt: str) -> None:
+        """把选中的增量 JSON 导出为 Excel/HTML 浏览文件（导入临时库后导出，不改主库）"""
+        if self._lock_on:
+            return
+        src = filedialog.askopenfilename(
+            title="选择增量备份 JSON 文件", parent=self,
+            filetypes=[("增量备份 JSON", "*.json"), ("JSON", "*.json")])
+        if not src:
+            return
+        if fmt == "excel":
+            out = filedialog.asksaveasfilename(
+                title="另存为 Excel", parent=self, defaultextension=".xlsx",
+                initialfile="incremental_export.xlsx",
+                filetypes=[("Excel 工作簿", "*.xlsx")])
+        else:
+            out = filedialog.asksaveasfilename(
+                title="另存为 HTML", parent=self, defaultextension=".html",
+                initialfile="incremental_export.html",
+                filetypes=[("HTML 页面", "*.html")])
+        if not out:
+            return
+        try:
+            n = export_incremental_to(self.db, src, out, fmt)
+        except Exception as exc:
+            messagebox.showerror("导出失败", f"无法导出：{exc}", parent=self)
+            return
+        self.toast(f"✅ 已导出 {n} 条供浏览")
+
+    def _export_incremental_file_to(self) -> None:
+        """定位/复制当日增量备份文件到指定位置"""
+        code = get_computer_code(self.db)
+        day = datetime.now().strftime("%Y-%m-%d")
+        src = os.path.join(incr_dir(self.db),
+                           f"{config.INCR_FILE_PREFIX}_{code}_{day}.json")
+        if not os.path.isfile(src):
+            messagebox.showinfo("提示", "今日暂无增量备份文件"
+                                       "（无当日新增数据时不会生成）。", parent=self)
+            return
+        out = filedialog.asksaveasfilename(
+            title="导出增量备份文件到", parent=self,
+            initialfile=os.path.basename(src), defaultextension=".json",
+            filetypes=[("JSON", "*.json")])
+        if not out:
+            return
+        try:
+            shutil.copy2(src, out)
+            self.toast("✅ 已导出增量备份文件")
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc), parent=self)
 
     def _export_json(self, current_only: bool = False) -> None:
         cat = self._current_subtree_cat_id() if current_only else None
@@ -1607,11 +1960,17 @@ class MainWindow(ctk.CTk):
     # 设置（2026-08-18："⚙ 设置"入口；持久化到数据库 meta 表）
     # ------------------------------------------------------------------ #
     def destroy(self) -> None:
-        """销毁前保存设置（记住窗口大小/视图模式/详情策略）。"""
+        """销毁前保存设置 + 生成当日增量备份（失败仅控制台提示，不阻塞退出）。"""
         try:
             self._save_settings()
         except Exception:
             pass
+        try:  # 2026-08-29（M4）：每次关闭软件时执行每日增量备份
+            r = write_incremental(self.db)
+            if not r["ok"] and r.get("error"):
+                print(f"[增量备份] 失败（不阻塞退出）：{r['error']}")
+        except Exception as exc:
+            print(f"[增量备份] 失败（不阻塞退出）：{exc}")
         super().destroy()
 
     def _current_size(self) -> str:

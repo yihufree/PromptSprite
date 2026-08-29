@@ -147,6 +147,12 @@ def main() -> None:
         # （分类按名复用、条目按名 upsert），版本升级不再清空任何用户数据。
         app.after(300, lambda: _run_builtin_import(app, db))
 
+    # 4.1 老版本数据迁移向导（2026-08-29，M5）：
+    # 存在未归属根目录（旧库升级后尚未分配项目类别）且用户未取消过 → 自动弹出
+    if (not args.smoke and db.list_unassigned_domains()
+            and db.get_meta(config.META_MIGRATE_WIZARD_DISMISSED) != "1"):
+        app.after(900, app._open_migrate_wizard)
+
     # 5. 全局热键（失败降级，不影响主功能）
     if not args.smoke:
         ok = hotkey.register_global_hotkey(

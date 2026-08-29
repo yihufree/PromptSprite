@@ -9,6 +9,7 @@ excel_io.py - Excel(.xlsx) 数据导入导出（批量编辑场景）
 """
 from openpyxl import Workbook, load_workbook
 
+from .. import config  # 2026-08-29（B3 修复）：新建根目录兜底归入"未明确分类"
 from ..database import Database  # 2026-08-18（P1-1）：内容判重键 content_key
 from ..models import Entry
 from .json_io import _gather_categories, _chain_names
@@ -25,7 +26,12 @@ def resolve_category_path(db, domain_name: str, l1_name: str, l2_name: str):
     if not domain_name:
         return None
     domain = next((d for d in db.list_domains() if d["name"] == domain_name), None)
-    did = domain["id"] if domain else db.add_domain(domain_name)
+    if domain:
+        did = domain["id"]
+    else:
+        # 2026-08-29（B3 修复）：新建根目录默认归入"未明确分类"，避免落"未分配"
+        fallback = db.ensure_project(config.PROJECT_FALLBACK)
+        did = db.add_domain(domain_name, project_id=fallback)
     if not l1_name:
         return None
     l1 = next((c for c in db.list_categories(parent_id=None) if c["name"] == l1_name), None)
@@ -90,8 +96,11 @@ def count_excel_rows(path) -> int:
 
 
 def import_excel(db, path, progress_cb=None) -> dict:
-    """导入 xlsx；返回统计 {'entries': n}"""
-    wb = load_workbook(path)
+    """导入 xlsx；返回统计 {'entries': n}
+
+    2026-08-29（P2 修复）：改用 read_only 流式读取，避免大文件内存暴涨。
+    """
+    wb = load_workbook(path, read_only=True)
     try:
         ws = wb.active
         header = [str(c.value).strip() if c.value else "" for c in ws[1]]

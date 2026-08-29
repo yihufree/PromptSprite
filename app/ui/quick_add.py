@@ -17,6 +17,7 @@ from tkinter import messagebox, simpledialog
 
 import customtkinter as ctk
 
+from .. import config  # 2026-08-29（B2 修复）：新增根目录兜底归入"未明确分类"
 from ..models import Entry
 
 _HOVER_MS = 200  # 悬停锁定判定时长（秒级换算：0.2 秒）
@@ -26,6 +27,50 @@ _ADD_STYLE = dict(fg_color="#e8ecf1", hover_color="#d5dce5", text_color="#1f2937
 
 # 选中态样式（与主界面一致：比默认按钮颜色稍稍加深，突出 根目录→一级→二级 选中链路）
 _SEL_STYLE = dict(fg_color="#25639c", hover_color="#1d4f7c", text_color="white")
+
+
+class _Tip:
+    """轻量悬停提示（2026-08-29：窄列长名称查看完整内容，与主窗口一致）"""
+
+    def __init__(self, widget, text: str):
+        self.widget = widget
+        self.text = text
+        self._tip = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, _e=None):
+        if self._tip is not None:
+            return
+        self._tip = tk.Toplevel(self.widget)
+        self._tip.wm_overrideredirect(True)
+        tk.Label(self._tip, text=self.text, justify="left", bg="#ffffe0",
+                 relief="solid", borderwidth=1, wraplength=420, padx=8, pady=6,
+                 font=("Microsoft YaHei", 10)).pack()
+        self._tip.update_idletasks()
+        w, h = self._tip.winfo_reqwidth(), self._tip.winfo_reqheight()
+        sw, sh = self.widget.winfo_screenwidth(), self.widget.winfo_screenheight()
+        x = self.widget.winfo_rootx() + 16
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        if x + w > sw:
+            x = max(sw - w - 8, 0)
+        if y + h > sh:
+            y = max(self.widget.winfo_rooty() - h - 4, 0)
+        self._tip.wm_geometry(f"+{x}+{y}")
+
+    def _hide(self, _e=None):
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+
+def _maybe_tooltip(btn, name: str, budget: int) -> None:
+    """长名称悬停提示：名称长度超过列宽预算时附加提示（与主窗口 _attach_nav_tooltip 一致）"""
+    if len(name) > budget:
+        _Tip(btn, name)
 
 # ⑧/⑨ 提示词文本框（2026-08-19）：空时默认 6 行（120px）可见；输入内容后按实际行数自适应；
 # 无内容时恢复 6 行。CTkTextbox.height 单位为像素，120px ≈ 6 行完整可见。
@@ -58,6 +103,11 @@ class QuickAddWindow(ctk.CTkToplevel):
         self._saved_count = 0
         # 2026-08-19：选中链路高亮与保存目标
         self._uncat_locked = False   # 显式锁定"未分类"：保存时不再自动归入选中链路的分类
+        # 2026-08-29（快速新建四级化同步）：项目类别（最高层级）状态与按钮引用
+        self._project_id = None      # 当前项目类别 id；None = 未分配视图
+        self._project_ready = False  # 首次导航默认项目是否已确定
+        self._p_btns = {}            # 项目类别列按钮引用
+        self._p_styles = {}          # 项目类别列按钮原始配色
         self._l0_btns = {}           # 根目录列按钮引用（选中高亮原地更新用）
         self._l1_btns = {}           # 一级分类列按钮引用
         self._l2_btns = {}           # 二级分类列按钮引用
@@ -66,42 +116,45 @@ class QuickAddWindow(ctk.CTkToplevel):
         self._l2_styles = {}
 
         self.title("✚ 快速新建提示词（悬停选定分类，无需点击）")
-        self.geometry("1020x700")
+        self.geometry("1200x700")  # 2026-08-29：增加"项目类别"列，窗口加宽
         self.resizable(True, True)
         self.transient(master)
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.grid_rowconfigure(1, weight=1)
-        self.grid_columnconfigure(3, weight=1)
+        self.grid_columnconfigure(4, weight=1)
 
         self._build_top()
         self._build_columns()
         self._build_form()
-        self._load_domains()
+        self._load_projects()
 
     # ------------------------------------------------------------------ #
     # 布局
     # ------------------------------------------------------------------ #
     def _build_top(self):
         top = ctk.CTkFrame(self)
-        top.grid(row=0, column=0, columnspan=4, sticky="ew", padx=8, pady=(8, 4))
+        top.grid(row=0, column=0, columnspan=5, sticky="ew", padx=8, pady=(8, 4))
         ctk.CTkButton(top, text="📂 归入未分类", width=120, fg_color="#8a94a6",
                       command=self._lock_uncategorized).pack(side="left", padx=4)
         self.lock_label = ctk.CTkLabel(top, text="未锁定分类（请悬停选择）", text_color="gray")
         self.lock_label.pack(side="left", padx=12)
 
     def _build_columns(self):
-        self.l0_frame = ctk.CTkScrollableFrame(self, width=129, label_text="根目录（悬停）")
-        self.l1_frame = ctk.CTkScrollableFrame(self, width=226, label_text="一级分类（悬停）")
-        self.l2_frame = ctk.CTkScrollableFrame(self, width=180, label_text="二级分类（悬停）")
-        self.l0_frame.grid(row=1, column=0, sticky="nsew", padx=(8, 2), pady=4)
-        self.l1_frame.grid(row=1, column=1, sticky="nsew", padx=2, pady=4)
-        self.l2_frame.grid(row=1, column=2, sticky="nsew", padx=(2, 8), pady=4)
+        # 2026-08-29（快速新建四级化同步）：项目类别 → 根目录 → 一级 → 二级
+        self.p_frame = ctk.CTkScrollableFrame(self, width=112, label_text="项目类别（悬停）")
+        self.l0_frame = ctk.CTkScrollableFrame(self, width=112, label_text="根目录（悬停）")
+        self.l1_frame = ctk.CTkScrollableFrame(self, width=168, label_text="一级分类（悬停）")
+        self.l2_frame = ctk.CTkScrollableFrame(self, width=168, label_text="二级分类（悬停）")
+        self.p_frame.grid(row=1, column=0, sticky="nsew", padx=(8, 2), pady=4)
+        self.l0_frame.grid(row=1, column=1, sticky="nsew", padx=2, pady=4)
+        self.l1_frame.grid(row=1, column=2, sticky="nsew", padx=2, pady=4)
+        self.l2_frame.grid(row=1, column=3, sticky="nsew", padx=(2, 8), pady=4)
 
     def _build_form(self):
         # 固定底部按钮 + 滚动输入区（参考主窗口详情区：按钮始终可见）
         form_root = ctk.CTkFrame(self)
-        form_root.grid(row=1, column=3, sticky="nsew", padx=(0, 8), pady=4)
+        form_root.grid(row=1, column=4, sticky="nsew", padx=(0, 8), pady=4)
         form_root.grid_rowconfigure(0, weight=1)
         form_root.grid_columnconfigure(0, weight=1)
 
@@ -161,11 +214,13 @@ class QuickAddWindow(ctk.CTkToplevel):
             self._hover_timer = None
 
     # ------------------------------------------------------------------ #
-    # 选中链路高亮（2026-08-19：与主界面一致，突出 根目录→一级→二级 选中项）
+    # 选中链路高亮（2026-08-19：与主界面一致；2026-08-29 扩展为四列 项目→根目录→一级→二级）
     # ------------------------------------------------------------------ #
     def _clear_nav_btns(self, col: str) -> None:
         """清空某一列按钮引用与原始配色记录（该列重建时调用）"""
-        if col == "l0":
+        if col == "p":
+            self._p_btns, self._p_styles = {}, {}
+        elif col == "l0":
             self._l0_btns, self._l0_styles = {}, {}
         elif col == "l1":
             self._l1_btns, self._l1_styles = {}, {}
@@ -186,7 +241,9 @@ class QuickAddWindow(ctk.CTkToplevel):
             btn.configure(fg_color=fg, hover_color=hover, text_color=text)
 
     def _apply_chain_highlight(self) -> None:
-        """原地更新三列选中高亮：根目录=_domain_id、一级=_active_cat_id、二级=_cat_id"""
+        """原地更新四列选中高亮：项目=_project_id、根目录=_domain_id、一级=_active_cat_id、二级=_cat_id"""
+        for pid, btn in self._p_btns.items():
+            self._style_nav_btn(btn, pid == self._project_id, self._p_styles.get(pid))
         for cid, btn in self._l0_btns.items():
             self._style_nav_btn(btn, cid == self._domain_id, self._l0_styles.get(cid))
         for cid, btn in self._l1_btns.items():
@@ -199,12 +256,80 @@ class QuickAddWindow(ctk.CTkToplevel):
         for child in frame.winfo_children():
             child.destroy()
 
+    # ------------------------------------------------------------------ #
+    # 项目类别（2026-08-29 快速新建四级化同步）
+    # ------------------------------------------------------------------ #
+    def _load_projects(self) -> None:
+        """渲染项目类别列（含新增按钮、"未分配"虚拟项），并按当前项目加载根目录列"""
+        self._clear(self.p_frame)
+        self._clear_nav_btns("p")
+        ctk.CTkButton(self.p_frame, text="➕ 新增项目类别", height=28, **_ADD_STYLE,
+                      command=self._add_project).pack(fill="x", padx=6, pady=2)
+        if not self._project_ready:   # 首次默认：存在未分配根目录则停留"未分配"，否则选第一个项目
+            self._project_ready = True
+            if self.db.list_unassigned_domains():
+                self._project_id = None
+            else:
+                ps = self.db.list_projects()
+                self._project_id = ps[0]["id"] if ps else None
+        for p in self.db.list_projects():
+            b = ctk.CTkButton(self.p_frame, text=p["name"], anchor="w", height=30)
+            b.pack(fill="x", padx=6, pady=2)
+            self._p_btns[p["id"]] = b
+            self._p_styles[p["id"]] = (b.cget("fg_color"), b.cget("hover_color"),
+                                        b.cget("text_color"))
+            b.bind("<Enter>",
+                   lambda _e, pid=p["id"]: self._schedule_hover(_HOVER_MS,
+                                                                lambda: self._select_project(pid)))
+            b.bind("<Leave>", lambda _e: self._cancel_hover())
+            _maybe_tooltip(b, p["name"], 6)  # 2026-08-29：长名称悬停提示（与主窗口一致）
+        if self.db.list_unassigned_domains():
+            b = ctk.CTkButton(self.p_frame, text="🗂 未分配", anchor="w", height=30)
+            b.pack(fill="x", padx=6, pady=2)
+            self._p_btns[None] = b
+            self._p_styles[None] = (b.cget("fg_color"), b.cget("hover_color"),
+                                    b.cget("text_color"))
+            b.bind("<Enter>",
+                   lambda _e: self._schedule_hover(_HOVER_MS,
+                                                   lambda: self._select_project(None)))
+            b.bind("<Leave>", lambda _e: self._cancel_hover())
+        self._apply_chain_highlight()
+        self._load_domains()
+
+    def _select_project(self, project_id) -> None:
+        """选择项目类别（None=未分配视图）：切换后重建根目录列并清空子列"""
+        if self._project_id == project_id:
+            self._apply_chain_highlight()
+            return
+        self._project_id = project_id
+        self._domain_id = None
+        self._active_cat_id = None
+        self._cat_id = None
+        self._uncat_locked = False
+        self.lock_label.configure(text="未锁定分类（请悬停选择）", text_color="gray")
+        self._clear(self.l1_frame)
+        self._clear(self.l2_frame)
+        self._clear_nav_btns("l1")
+        self._clear_nav_btns("l2")
+        self._load_domains()
+
+    def _add_project(self) -> None:
+        name = simpledialog.askstring("新增项目类别", "请输入项目类别名称：", parent=self)
+        if name and name.strip():
+            pid = self.db.add_project(name.strip())
+            self._project_ready = True
+            self._project_id = pid
+            self._load_projects()
+
     def _load_domains(self) -> None:
+        """渲染根目录列（当前项目类别下；"未分配"视图显示无归属根目录）"""
         self._clear(self.l0_frame)
         self._clear_nav_btns("l0")
         ctk.CTkButton(self.l0_frame, text="➕ 新增根目录", height=28, **_ADD_STYLE,
                       command=self._add_domain).pack(fill="x", padx=6, pady=2)
-        for d in self.db.list_domains():
+        domains = (self.db.list_unassigned_domains() if self._project_id is None
+                   else self.db.list_domains(project_id=self._project_id))
+        for d in domains:
             b = ctk.CTkButton(self.l0_frame, text=d["name"], anchor="w", height=30)
             b.pack(fill="x", padx=6, pady=2)
             # 2026-08-19：记录按钮引用与原始配色，供选中链路高亮原地更新
@@ -215,6 +340,7 @@ class QuickAddWindow(ctk.CTkToplevel):
                    lambda _e, did=d["id"]: self._schedule_hover(_HOVER_MS,
                                                                 lambda: self._load_l1(did)))
             b.bind("<Leave>", lambda _e: self._cancel_hover())
+            _maybe_tooltip(b, d["name"], 6)  # 2026-08-29：长名称悬停提示（与主窗口一致）
         self._apply_chain_highlight()
 
     def _load_l1(self, domain_id: int) -> None:
@@ -246,6 +372,7 @@ class QuickAddWindow(ctk.CTkToplevel):
                    lambda _e, cid=c["id"]: self._schedule_hover(_HOVER_MS,
                                                                 lambda: self._load_l2(cid)))
             b.bind("<Leave>", lambda _e: self._cancel_hover())
+            _maybe_tooltip(b, c["name"], 10)  # 2026-08-29：长名称悬停提示（与主窗口一致）
         self._apply_chain_highlight()
 
     def _load_l2(self, cat_id: int, force: bool = False) -> None:
@@ -279,6 +406,7 @@ class QuickAddWindow(ctk.CTkToplevel):
                    lambda _e, cid=c["id"]: self._schedule_hover(_HOVER_MS,
                                                                 lambda: self._lock(cid)))
             b.bind("<Leave>", lambda _e: self._cancel_hover())
+            _maybe_tooltip(b, c["name"], 10)  # 2026-08-29：长名称悬停提示（与主窗口一致）
         self._apply_chain_highlight()
 
     def _lock(self, cat_id, note: str = None) -> None:
@@ -306,9 +434,17 @@ class QuickAddWindow(ctk.CTkToplevel):
     # ------------------------------------------------------------------ #
     def _add_domain(self) -> None:
         name = simpledialog.askstring("新增根目录", "请输入根目录名称：", parent=self)
-        if name and name.strip():
-            self.db.add_domain(name.strip())
-            self._load_domains()
+        if not (name and name.strip()):
+            return
+        # 2026-08-29（B2 修复）：新增根目录弹窗选择项目类别（与主窗口一致），未选择归入"未明确分类"
+        from .project_chooser import choose_project
+        r = choose_project(self, self.db, "选择项目类别", f"【{name.strip()}】归属项目类别：")
+        if r is None:
+            project_id = self.db.ensure_project(config.PROJECT_FALLBACK)
+        else:
+            project_id = r[1]
+        self.db.add_domain(name.strip(), project_id=project_id)
+        self._load_domains()
 
     def _add_l1(self) -> None:
         if not self._domain_id:

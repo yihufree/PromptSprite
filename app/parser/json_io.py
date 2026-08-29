@@ -3,16 +3,21 @@
 json_io.py - JSON 数据导入导出（完整备份/还原）
 创建日期：2026-08-12（阶段六创建；阶段八重构为全局分类+领域关联 v2）
 
-导出格式（version 2）：
+导出格式（version 3，2026-08-29 四级分类施工）：
 {
-  "version": 2,
+  "version": 3,
   "exported_at": "…",
+  "computer_code": "PC-HOME",          // 增量备份来源电脑代号（普通导出可为空）
+  "day": "2026-08-29",                 // 增量备份日期（普通导出可为空）
+  "projects":      [{"name": "日常学习记录", "sort_order": 0}, …],   // 项目类别（最高层级）
+  "domain_projects": {"视频": "日常学习记录", …},                    // 根目录 → 项目类别
   "domains":      [{"name": "视频", "sort_order": 0}, …],
   "domain_links": {"视频": ["第一维度：…", …]},          // 领域 ↔ 一级分类（多对一）
   "categories":   [{"parent": null, "name": "第一维度：…", "sort_order": 0}, …],
   "entries":      [{"path": ["第一维度：…", "写实影像类"], 9字段…, "is_favorite": 0}, …]
 }
-说明：分类为全局共享树；path 不含领域；path 为空表示"未分类"。
+说明：分类为全局共享树；path 不含领域；path 为空表示"未分类"；
+version 2 旧文件仍可导入（无项目归属 → 根目录落"未分配"）。
 """
 import json
 from datetime import datetime
@@ -20,7 +25,7 @@ from datetime import datetime
 from ..database import Database  # 2026-08-18（P1-1）：内容判重键 content_key
 from ..models import Entry
 
-JSON_VERSION = 2
+JSON_VERSION = 3
 
 
 # ---------------------------------------------------------------------- #
@@ -88,8 +93,11 @@ def _entry_payload(db, e) -> dict:
 # ---------------------------------------------------------------------- #
 # 导出
 # ---------------------------------------------------------------------- #
-def export_json(db, path, category_id=None) -> int:
-    """导出全部（或指定分类子树）为 JSON；返回导出的条目数"""
+def export_json(db, path, category_id=None, computer_code=None, day=None) -> int:
+    """导出全部（或指定分类子树）为 JSON（v3，含项目类别归属）；返回导出的条目数。
+
+    computer_code/day：增量备份场景补充来源信息（电脑代号/日期）；普通导出可省略。
+    """
     if category_id is None:
         export_cats = _gather_categories(db)
         export_entries = db.list_all_entries()
@@ -104,9 +112,17 @@ def export_json(db, path, category_id=None) -> int:
         cat_ids = [c["id"] for c in subtree]
         export_entries = [e for cid in cat_ids for e in db.list_entries(cid)]
 
+    projects = db.list_projects()
+    p_by_id = {p["id"]: p for p in projects}
+    domain_projects = {}
+    for d in db.list_domains():
+        if d.get("project_id") and d["project_id"] in p_by_id:
+            domain_projects[d["name"]] = p_by_id[d["project_id"]]["name"]
     data = {
         "version": JSON_VERSION,
         "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "projects": [{"name": p["name"], "sort_order": p["sort_order"]} for p in projects],
+        "domain_projects": domain_projects,
         "domains": [{k: d[k] for k in ("name", "sort_order")} for d in db.list_domains()],
         "domain_links": _domain_links(db, [c["id"] for c in export_cats]),
         "categories": [{"parent": (db.get_category(c["parent_id"])["name"]
@@ -115,6 +131,10 @@ def export_json(db, path, category_id=None) -> int:
                        for c in export_cats],
         "entries": [_entry_payload(db, e) for e in export_entries],
     }
+    if computer_code:
+        data["computer_code"] = computer_code
+    if day:
+        data["day"] = day
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return len(export_entries)
@@ -130,20 +150,39 @@ def count_json_entries(path) -> int:
 
 
 def import_json(db, path, progress_cb=None) -> dict:
-    """导入 JSON 备份：重建全局分类树 + 领域关联 + 条目；返回统计"""
+    """导入 JSON 备份（v2/v3 兼容）：重建项目类别/全局分类树/领域关联/条目；返回统计"""
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
-    if data.get("version", 1) != JSON_VERSION:
+    ver = data.get("version", 1)
+    if ver not in (2, 3):
         raise ValueError("JSON 版本不兼容，请使用本软件导出的备份文件")
 
-    # 1. 领域（按名称复用或新建）
+    # 1. 项目类别（v3：恢复 根目录→项目类别 归属；v2 无则跳过）
+    project_map = {}
+    for pr in data.get("projects", []):
+        name = pr["name"]
+        existing = db.get_project_by_name(name)
+        if existing:
+            project_map[name] = existing["id"]
+        else:
+            try:
+                project_map[name] = db.add_project(name)
+            except Exception:
+                project_map[name] = db.ensure_project(name)
+    domain_projects = data.get("domain_projects", {})
+
+    # 2. 领域（按名称复用或新建；v3 恢复项目归属）
     domain_map = {}
     for d in data.get("domains", []):
         name = d["name"]
         existing = next((x for x in db.list_domains() if x["name"] == name), None)
-        domain_map[name] = existing["id"] if existing else db.add_domain(name)
+        did = existing["id"] if existing else db.add_domain(name)
+        pname = domain_projects.get(name)
+        if pname and pname in project_map:
+            db.move_domain_to_project(did, project_map[pname])
+        domain_map[name] = did
 
-    # 2. 全局分类（父先子后；key=(父名或None, 名称)）
+    # 3. 全局分类（父先子后；key=(父名或None, 名称)）
     # 2026-08-18（P1-3 修复）：分类按名称复用（与 Excel 导入一致），重复导入不再产生重复分类
     cat_map = {}
     for c in data.get("categories", []):
@@ -160,7 +199,7 @@ def import_json(db, path, progress_cb=None) -> dict:
             cid = db.add_category(c["name"], parent_id=pid)
         cat_map[(c.get("parent"), c["name"])] = cid
 
-    # 3. 领域 ↔ 一级分类 关联（多对一共享）
+    # 4. 领域 ↔ 一级分类 关联（多对一共享）
     for dom_name, l1_names in data.get("domain_links", {}).items():
         did = domain_map.get(dom_name)
         if did is None:
@@ -170,7 +209,7 @@ def import_json(db, path, progress_cb=None) -> dict:
             if cid:
                 db.link_domain_category(did, cid)
 
-    # 4. 条目（2026-08-18：P2-4 批量插入；P1-1 详情内容去重——内容相同才跳过）
+    # 5. 条目（2026-08-18：P2-4 批量插入；P1-1 详情内容去重——内容相同才跳过）
     total = len(data.get("entries", []))
     done, skipped, processed = 0, 0, 0
     pending = []
@@ -207,4 +246,32 @@ def import_json(db, path, progress_cb=None) -> dict:
             progress_cb(processed, total, e.name)
     if pending:
         db.add_entries_batch(pending)
-    return {"entries": done, "skipped": skipped, "categories": len(data.get("categories", []))}
+
+    # 6. 删除同步（2026-08-29 增量备份增强）：导入"当日删除"到目标库（尽力而为）
+    #    - 分类：按名称链定位后删除（级联其子分类）；条目随之转"未分类"（与原库语义一致）
+    #    - 条目：按"详情内容"判重键删除（目标库内容相同视为同一逻辑条目）
+    #    - 根目录：按名称删除（仅解除关联）
+    deleted = {"entries": 0, "categories": 0, "domains": 0}
+    for dc in data.get("deleted_categories", []):
+        chain = dc.get("chain") or []
+        if not chain:
+            continue
+        cid = db.find_category_by_chain(chain)
+        if cid is not None:
+            db.delete_category(cid)
+            deleted["categories"] += 1
+    for de in data.get("deleted_entries", []):
+        cid = None
+        chain = de.get("chain") or []
+        if chain:
+            cid = db.find_category_by_chain(chain)
+        deleted["entries"] += db.delete_entries_by_content_key(de.get("content_key", ""),
+                                                                cat_id=cid)
+    for dd in data.get("deleted_domains", []):
+        dom = next((x for x in db.list_domains() if x["name"] == dd.get("name")), None)
+        if dom is not None:
+            db.delete_domain(dom["id"])
+            deleted["domains"] += 1
+
+    return {"entries": done, "skipped": skipped, "categories": len(data.get("categories", [])),
+            "deleted": deleted}

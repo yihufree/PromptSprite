@@ -8,7 +8,7 @@ import sys
 
 # ---------- 应用基础信息 ----------
 APP_NAME = "PromptSprite"
-APP_VERSION = "1.3.0"  # 2026-08-22（第008条）：全项目版本体系统一为 1.3.0（全面审核 + 四份文档新版 + "关于"修订）
+APP_VERSION = "1.4.0"  # 2026-08-29（施工M6）：四级分类体系 + 老数据迁移 + 增量备份
 
 # ---------- 数据库 / 目录 ----------
 DB_FILE_NAME = "prompts.db"
@@ -52,6 +52,30 @@ DETAIL_MODE_COMPACT = "compact" # 始终精简（隐藏 ③-⑦）
 
 # ---------- 自动备份 ----------
 BACKUP_KEEP_COUNT = 5
+
+# ---------- 项目类别（四级分类最高层级，2026-08-29 施工新增） ----------
+# 预置项目类别（最高层级）
+PROJECT_PRESETS = ["日常学习记录", "网上资源收集", "个人梳理资源", "本人创作作品", "个人经验总结"]
+# 迁移时"未命中且用户未回答"的兜底项目类别（惰性创建）
+PROJECT_FALLBACK = "未明确分类"
+# 根目录名（库中实际名称）→ 项目类别名；迁移前弹出供人工核对（施工方案决策 2）
+PROJECT_DOMAIN_MAPPING = {
+    "日常学习记录": ["视频", "图像", "音频", "文学", "学术", "专业报告"],
+    "网上资源收集": ["海外AI绘画案例库", "AI绘画精选案例", "GPT Image 提示词库", "AI生图提示词大全"],
+    "个人梳理资源": ["视觉风格分类"],
+    "本人创作作品": ["yifree学习与作品"],
+    "个人经验总结": ["计算机编程"],
+}
+
+# ---------- 增量备份（2026-08-29 施工新增） ----------
+INCR_DIR_NAME = "incremental"          # data/backup/incremental/
+INCR_KEEP_DAYS = 30                    # 增量备份文件按日保留天数（用户确认）
+INCR_FILE_PREFIX = "增量"
+META_COMPUTER_CODE = "settings_computer_code"   # 电脑代号
+META_INCR_LAST_SYNC = "incr_last_sync"          # 增量备份游标
+META_INCR_KEEP_DAYS = "settings_incr_keep_days" # 增量备份保留天数（用户设置，默认 INCR_KEEP_DAYS）
+META_MIGRATE_MAPPING_VER = "migrate_mapping_version"  # 迁移映射表版本
+META_MIGRATE_WIZARD_DISMISSED = "migrate_wizard_dismissed"  # 迁移向导是否已取消过（避免每次启动打扰）
 
 # 项目根目录：config.py 位于 app/ 下，取其上级
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

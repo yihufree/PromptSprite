@@ -108,15 +108,25 @@ class CopyMoveDialog(ctk.CTkToplevel):
     # 构建
     # ------------------------------------------------------------------ #
     def _build_tree(self) -> None:
-        for d in self.db.list_domains():
-            did = self.tree.insert("", "end", text=d["name"], open=True)
-            self._iid_node[did] = ("domain", d["id"])
-            for l1 in self.db.list_categories(domain_id=d["id"], parent_id=None):
-                l1_id = self.tree.insert(did, "end", text=l1["name"], open=True)
-                self._iid_node[l1_id] = ("l1", l1["id"])
-                for l2 in self.db.list_categories(parent_id=l1["id"]):
-                    l2_id = self.tree.insert(l1_id, "end", text=l2["name"])
-                    self._iid_node[l2_id] = ("l2", l2["id"])
+        for p in self.db.list_projects():
+            pid = self.tree.insert("", "end", text=p["name"], open=True)
+            self._iid_node[pid] = ("project", p["id"])
+            for d in self.db.list_domains(project_id=p["id"]):
+                self._insert_domain(pid, d)
+        # 未分配根目录（无归属，置于树根）
+        for d in self.db.list_unassigned_domains():
+            self._insert_domain("", d, suffix="（未分配）")
+
+    def _insert_domain(self, parent, d: dict, suffix: str = "") -> None:
+        """在树中插入一个根目录节点及其一级/二级分类子树"""
+        did = self.tree.insert(parent, "end", text=f"{d['name']}{suffix}", open=True)
+        self._iid_node[did] = ("domain", d["id"])
+        for l1 in self.db.list_categories(domain_id=d["id"], parent_id=None):
+            l1_id = self.tree.insert(did, "end", text=l1["name"], open=True)
+            self._iid_node[l1_id] = ("l1", l1["id"])
+            for l2 in self.db.list_categories(parent_id=l1["id"]):
+                l2_id = self.tree.insert(l1_id, "end", text=l2["name"])
+                self._iid_node[l2_id] = ("l2", l2["id"])
 
     # ------------------------------------------------------------------ #
     # 目标解析与预览
@@ -136,7 +146,12 @@ class CopyMoveDialog(ctk.CTkToplevel):
             return None, None, None
         kind, tid = self._iid_node.get(sel[0], (None, None))
         if self.src_type == "domain":
-            # 目标只能是另一根目录（作为其新一级分类）
+            # 目标：另一项目类别（整体移动/复制归属）或另一根目录（作为其新一级分类）
+            if kind == "project":
+                cur = self.db.get_domain(self.src_id)
+                if cur and tid == cur.get("project_id"):
+                    return None, None, None  # 已在同一项目类别，无需操作
+                return "domain_to_project", tid, None
             if kind == "domain" and tid != self.src_id:
                 return "domain_below", tid, None
             return None, None, None
@@ -163,6 +178,15 @@ class CopyMoveDialog(ctk.CTkToplevel):
         lines = []
         if tk_ is None:
             lines.append("请选择有效的目标位置。")
+        elif tk_ == "domain_to_project":
+            p = self.db.get_project(tid)
+            lines.append(f"目标：项目类别【{p['name']}】下")
+            if self.action == "move":
+                lines.append(f"根目录【{self.src_name}】整体移动到该项目（名称不变，其下分类/条目随动）。")
+            else:
+                new_name = self.db.unique_domain_name(self.src_name)
+                lines.append(f"根目录【{self.src_name}】复制为【{new_name}】挂到该项目"
+                             f"（重名自动加序号，源保留，分类/条目深拷贝）。")
         elif tk_ == "domain_below":
             d = self.db.get_domain(tid)
             lines.append(f"目标：根目录【{d['name']}】下，作为其新的一级分类")

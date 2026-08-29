@@ -19,6 +19,7 @@ if _PROJECT_ROOT not in sys.path:
 _MODULES = [
     ("app.database", "数据库层自测"),
     ("app.backup", "备份模块自测"),
+    ("app.incremental_backup", "增量备份模块自测"),  # 2026-08-29：纳入统一自测入口
     ("app.parser.md_parser", "MD 解析器自测"),
 ]
 

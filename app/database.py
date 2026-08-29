@@ -11,13 +11,15 @@ database.py - PromptSprite SQLite 数据访问层
 
 自测：python -m app.database
 """
+import json  # 2026-08-29（增量备份增强）：删除日志名称链序列化
 import os
 import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
-from .config import data_dir, PRESET_DOMAINS
+from .config import (data_dir, PRESET_DOMAINS, PROJECT_PRESETS, PROJECT_FALLBACK,
+                     PROJECT_DOMAIN_MAPPING)
 from .models import Entry  # 2026-08-18（P2-5）：Domain/Category 冗余数据类已删除，仅保留 Entry
 
 
@@ -26,27 +28,48 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# 建表 SQL（schema v2）：
+# 建表 SQL（schema v3，2026-08-29 四级分类施工）：
+#  - 新增 projects 表：项目类别（最高层级），domains.project_id 归属项目类别
 #  - 分类为全局共享树（不再归属单一领域），通过 domain_category 实现 领域↔一级分类 多对一关联
 #  - 外键：分类删除级联子分类；条目删除分类置 NULL(转入未分类)；领域删除仅解除关联（共享数据保留）
 _SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS domains (
+CREATE TABLE IF NOT EXISTS projects (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL UNIQUE,
     sort_order  INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS domains (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    sort_order  INTEGER DEFAULT 0,
+    project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS categories (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     parent_id   INTEGER DEFAULT NULL REFERENCES categories(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,
-    sort_order  INTEGER DEFAULT 0
+    sort_order  INTEGER DEFAULT 0,
+    created_at  TEXT,      -- 2026-08-29（增量备份增强）：分类创建时间（支持"新增空分类"增量）
+    updated_at  TEXT       -- 分类最后修改时间（改名/移动等）
 );
 
 CREATE TABLE IF NOT EXISTS domain_category (
     domain_id   INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
     category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
     PRIMARY KEY (domain_id, category_id)
+);
+
+-- 2026-08-29（增量备份增强）：删除日志——记录被删除的条目/分类/根目录，
+-- 供每日增量备份同步"删除操作"到其他电脑（导入时按名称链/内容键应用删除）。
+CREATE TABLE IF NOT EXISTS deletion_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,          -- 'entry' | 'category' | 'domain'
+    name        TEXT DEFAULT '',        -- 被删对象名称
+    chain       TEXT DEFAULT '',        -- JSON 名称链（一级/二级…），entry/category 用
+    content_key TEXT DEFAULT '',        -- 条目"详情内容"判重键（entry 用）
+    deleted_at  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS entries (
@@ -80,8 +103,8 @@ CREATE INDEX IF NOT EXISTS idx_entries_category   ON entries(category_id);
 CREATE INDEX IF NOT EXISTS idx_entries_favorite   ON entries(is_favorite);
 """
 
-# 数据库结构版本（meta 键 schema_version）；v1=旧版按领域归属分类，v2=全局分类+领域关联
-SCHEMA_VERSION = "2"
+# 数据库结构版本（meta 键 schema_version）；v1=旧版按领域归属分类，v2=全局分类+领域关联，v3=四级分类（项目类别）
+SCHEMA_VERSION = "3"
 
 
 class Database:
@@ -111,10 +134,47 @@ class Database:
         return any(r["name"] == column for r in cols)
 
     def _migrate_if_needed(self) -> None:
-        """v1 → v2 迁移：
-        旧版分类按 domain_id 归属单一领域；v2 改为全局分类 + domain_category 多对一关联。
-        迁移：把旧版一级分类(parent_id IS NULL)生成领域关联，再移除 domain_id 遗留列。
+        """结构迁移：v1 → v2 → v3 按序执行（幂等）＋ v3 增量增强补列。
+
+        - v1→v2：旧版分类按 domain_id 归属单一领域 → 全局分类 + domain_category 多对一关联；
+        - v2→v3：新增 projects 表 + domains.project_id 列 + 预置项目类别（四级分类最高层级）；
+        - v3 增强（2026-08-29）：categories 加 created_at/updated_at 列（历史数据回填为旧时间戳，
+          避免首次增量误把存量分类当"今日新增"）、新建 deletion_log 删除日志表。
+        注：v2→v3 仅做"结构"升级（建表/加列/预置），不移动任何数据；
+        根目录→项目类别的"归属分配"由 assign_domains_to_projects() 执行（迁移向导/自动迁移）。
         """
+        self._migrate_v1_to_v2()
+        self._migrate_v2_to_v3()
+        self._ensure_v3_enhancements()
+
+    def _ensure_v3_enhancements(self) -> None:
+        """v3 增量备份增强（幂等）：categories 时间戳列 + deletion_log 表。
+        历史分类回填为固定旧时间戳（1970-01-01），保证首次增量不误报存量分类。
+        """
+        if not self._has_column("categories", "created_at"):
+            self.conn.execute(
+                "ALTER TABLE categories ADD COLUMN created_at TEXT")
+        if not self._has_column("categories", "updated_at"):
+            self.conn.execute(
+                "ALTER TABLE categories ADD COLUMN updated_at TEXT")
+        self.conn.executescript(
+            "CREATE TABLE IF NOT EXISTS deletion_log ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " kind TEXT NOT NULL, name TEXT DEFAULT '', chain TEXT DEFAULT '',"
+            " content_key TEXT DEFAULT '', deleted_at TEXT)")
+        # 回填：旧数据无时间戳 → 设为固定旧时间（不在任何"今日"范围内）；
+        # 2026-08-29（复审优化）：仅当存在空值时执行，避免每次打开全表 UPDATE
+        if self.conn.execute(
+            "SELECT COUNT(*) FROM categories WHERE created_at IS NULL OR updated_at IS NULL"
+        ).fetchone()[0] > 0:
+            self.conn.execute(
+                "UPDATE categories SET created_at = COALESCE(created_at, '1970-01-01 00:00:00'),"
+                " updated_at = COALESCE(updated_at, '1970-01-01 00:00:00')"
+            )
+        self.conn.commit()
+
+    def _migrate_v1_to_v2(self) -> None:
+        """v1 → v2：旧版一级分类(parent_id IS NULL)生成领域关联，再移除 domain_id 遗留列。"""
         if self.get_meta("schema_version") is not None:
             return
         if self._has_column("categories", "domain_id"):
@@ -126,6 +186,23 @@ class Database:
                 self.conn.execute("ALTER TABLE categories DROP COLUMN domain_id")
             except sqlite3.OperationalError:
                 pass  # 新库无该列时忽略
+        self.set_meta("schema_version", "2")
+
+    def _migrate_v2_to_v3(self) -> None:
+        """v2 → v3（结构升级，幂等）：projects 表 + domains.project_id 列 + 预置项目类别。"""
+        if self.get_meta("schema_version") == SCHEMA_VERSION:
+            return
+        # 1. projects 表（_SCHEMA_SQL 已含 CREATE IF NOT EXISTS，确保旧库也有）
+        self.conn.executescript(_SCHEMA_SQL)
+        # 2. domains 加列（幂等）
+        if not self._has_column("domains", "project_id"):
+            self.conn.execute(
+                "ALTER TABLE domains ADD COLUMN project_id INTEGER "
+                "REFERENCES projects(id) ON DELETE SET NULL"
+            )
+        # 3. 预置项目类别
+        self.seed_preset_projects()
+        # 4. 版本号
         self.set_meta("schema_version", SCHEMA_VERSION)
 
     def _normalize_dimension_prefixes(self) -> None:
@@ -139,7 +216,8 @@ class Database:
             new_name = pat.sub("", r["name"])
             if new_name != r["name"]:
                 self.conn.execute(
-                    "UPDATE categories SET name = ? WHERE id = ?", (new_name, r["id"])
+                    "UPDATE categories SET name = ?, updated_at = ? WHERE id = ?",
+                    (new_name, _now(), r["id"]),  # 2026-08-29：改名同步 updated_at
                 )
                 changed = True
         if changed:
@@ -149,11 +227,12 @@ class Database:
         self.conn.close()
 
     def seed_preset_domains(self) -> None:
-        """写入预置根目录（仅当表为空时）"""
+        """写入预置根目录（仅当表为空时）；随后按映射自动归入项目类别（新库开箱即用四级）。"""
         if self.list_domains():
             return
         for name in PRESET_DOMAINS:
             self.add_domain(name)
+        self.assign_domains_to_projects(PROJECT_DOMAIN_MAPPING)
 
     def reset_content(self) -> None:
         """清除全部分类与条目（保留根目录与元信息）。
@@ -184,10 +263,12 @@ class Database:
     # ------------------------------------------------------------------ #
     # 根目录 Domain
     # ------------------------------------------------------------------ #
-    def add_domain(self, name: str) -> int:
+    def add_domain(self, name: str, project_id: Optional[int] = None) -> int:
+        """新建根目录；project_id 指定其所属项目类别（四级分类，可为空=未分配）"""
         order = self.conn.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM domains").fetchone()[0]
         cur = self.conn.execute(
-            "INSERT INTO domains(name, sort_order) VALUES(?, ?)", (name, order)
+            "INSERT INTO domains(name, sort_order, project_id) VALUES(?, ?, ?)",
+            (name, order, project_id),
         )
         self.conn.commit()
         return cur.lastrowid
@@ -200,8 +281,22 @@ class Database:
         row = self.conn.execute("SELECT * FROM domains WHERE id = ?", (domain_id,)).fetchone()
         return dict(row) if row else None
 
-    def list_domains(self) -> List[dict]:
-        rows = self.conn.execute("SELECT * FROM domains ORDER BY sort_order, id").fetchall()
+    def list_domains(self, project_id: Optional[int] = None) -> List[dict]:
+        """列出根目录；project_id 非空时仅返回该项目的根目录（四级分类过滤）"""
+        if project_id is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM domains WHERE project_id = ? ORDER BY sort_order, id",
+                (project_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute("SELECT * FROM domains ORDER BY sort_order, id").fetchall()
+        return [dict(r) for r in rows]
+
+    def list_unassigned_domains(self) -> List[dict]:
+        """project_id 为空的根目录（迁移分配前的存量 / 新建未指定项目的）"""
+        rows = self.conn.execute(
+            "SELECT * FROM domains WHERE project_id IS NULL ORDER BY sort_order, id"
+        ).fetchall()
         return [dict(r) for r in rows]
 
     def delete_domain(self, domain_id: int) -> dict:
@@ -209,6 +304,9 @@ class Database:
         返回受影响统计 {'categories': n, 'entries': m}（n/m 为该领域视角下的数量）
         """
         stat = self.count_domain_items(domain_id)
+        d = self.get_domain(domain_id)
+        if d:
+            self._log_deletion("domain", d["name"])  # 2026-08-29：记录根目录删除日志
         self.conn.execute("DELETE FROM domains WHERE id = ?", (domain_id,))
         self.conn.commit()
         return stat
@@ -236,6 +334,239 @@ class Database:
         return ids
 
     # ------------------------------------------------------------------ #
+    # 项目类别 Project（2026-08-29 四级分类施工新增）
+    # ------------------------------------------------------------------ #
+    def seed_preset_projects(self) -> None:
+        """写入预置项目类别（仅当表为空时）"""
+        if self.list_projects():
+            return
+        for name in PROJECT_PRESETS:
+            self.add_project(name)
+
+    def add_project(self, name: str) -> int:
+        order = self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM projects"
+        ).fetchone()[0]
+        cur = self.conn.execute(
+            "INSERT INTO projects(name, sort_order) VALUES(?, ?)", (name, order)
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_project(self, project_id: int) -> Optional[dict]:
+        row = self.conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_project_by_name(self, name: str) -> Optional[dict]:
+        row = self.conn.execute("SELECT * FROM projects WHERE name = ?", (name,)).fetchone()
+        return dict(row) if row else None
+
+    def list_projects(self) -> List[dict]:
+        rows = self.conn.execute("SELECT * FROM projects ORDER BY sort_order, id").fetchall()
+        return [dict(r) for r in rows]
+
+    def rename_project(self, project_id: int, new_name: str) -> None:
+        self.conn.execute("UPDATE projects SET name = ? WHERE id = ?", (new_name, project_id))
+        self.conn.commit()
+
+    def _project_id_tx(self, name: str) -> int:
+        """事务内：按名查找项目类别，不存在则插入（不 commit，供批量/迁移事务使用）"""
+        row = self.conn.execute("SELECT id FROM projects WHERE name = ?", (name,)).fetchone()
+        if row:
+            return row["id"]
+        order = self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM projects"
+        ).fetchone()[0]
+        cur = self.conn.execute(
+            "INSERT INTO projects(name, sort_order) VALUES(?, ?)", (name, order)
+        )
+        return cur.lastrowid
+
+    def ensure_project(self, name: str) -> int:
+        """按名查找或新建项目类别（惰性创建，如"未明确分类"兜底）"""
+        pid = self._project_id_tx(name)
+        self.conn.commit()
+        return pid
+
+    def count_project_domains(self, project_id: int) -> int:
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM domains WHERE project_id = ?", (project_id,)
+        ).fetchone()[0]
+
+    def delete_project(self, project_id: int,
+                       fallback_project_id: Optional[int] = None) -> dict:
+        """删除项目类别：其下根目录移至 fallback_project_id（无则置空=未分配）。
+        返回受影响统计 {'domains': n}（UI 层负责确认弹窗与兜底选择）"""
+        stat = {"domains": self.count_project_domains(project_id)}
+        if fallback_project_id is not None:
+            self.conn.execute(
+                "UPDATE domains SET project_id = ? WHERE project_id = ?",
+                (fallback_project_id, project_id),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE domains SET project_id = NULL WHERE project_id = ?", (project_id,)
+            )
+        self.conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        self.conn.commit()
+        return stat
+
+    def move_domain_to_project(self, domain_id: int,
+                               project_id: Optional[int]) -> None:
+        """移动根目录到其他项目类别（仅更新归属，分类树/条目不动）"""
+        self.conn.execute(
+            "UPDATE domains SET project_id = ? WHERE id = ?", (project_id, domain_id)
+        )
+        self.conn.commit()
+
+    def copy_domain_to_project(self, domain_id: int, project_id: int,
+                               new_name: str) -> int:
+        """复制根目录到其他项目类别：建改名副本挂目标项目（重名加序号由调用方保证），源保留"""
+        src = self.get_domain(domain_id)
+        if not src:
+            raise ValueError("根目录不存在")
+        try:
+            with self.conn:
+                cur = self.conn.execute(
+                    "INSERT INTO domains(name, sort_order, project_id) VALUES(?, ?, ?)",
+                    (new_name, self._next_domain_order_tx(), project_id),
+                )
+                new_domain_id = cur.lastrowid
+                for l1 in self.list_categories(domain_id=domain_id, parent_id=None):
+                    self._copy_subtree_tx(l1["id"], None, l1["name"], new_domain_id)
+            return new_domain_id
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def assign_domains_to_projects(self, mapping: dict, on_unmatched=None) -> dict:
+        """按名称把根目录分配到项目类别（迁移/向导核心，单事务、幂等可重跑）。
+
+        - mapping: {项目类别名: [根目录名, ...]}（按库中实际名称精确匹配）；
+        - on_unmatched: 回调 fn(domain_name, [项目名...]) -> 选中的项目名；返回 None 表示未回答，
+          该根目录归入兜底项目 PROJECT_FALLBACK（"未明确分类"，惰性创建）。
+        返回 {'matched': n, 'unmatched': m, 'fallback': k}
+        """
+        stats = {"matched": 0, "unmatched": 0, "fallback": 0}
+        try:
+            with self.conn:
+                # 1) 预置项目类别确保存在
+                for pname in PROJECT_PRESETS:
+                    self._project_id_tx(pname)
+                # 2) 匹配项：按映射精确名称更新归属
+                for pname, dom_names in mapping.items():
+                    pid = self._project_id_tx(pname)
+                    for dname in dom_names:
+                        row = self.conn.execute(
+                            "SELECT id FROM domains WHERE name = ?", (dname,)
+                        ).fetchone()
+                        if row:
+                            self.conn.execute(
+                                "UPDATE domains SET project_id = ? WHERE id = ?",
+                                (pid, row["id"]),
+                            )
+                            stats["matched"] += 1
+                # 3) 未匹配项：仍无归属的根目录 → 弹窗选择 / 兜底
+                projects = [p["name"] for p in self.list_projects()]
+                for d in self.conn.execute(
+                    "SELECT * FROM domains WHERE project_id IS NULL ORDER BY sort_order, id"
+                ).fetchall():
+                    chosen = None
+                    if on_unmatched is not None:
+                        try:
+                            chosen = on_unmatched(d["name"], list(projects))
+                        except Exception:
+                            chosen = None  # 回调异常视为未回答，安全兜底
+                    if chosen:
+                        pid = self._project_id_tx(chosen)
+                        self.conn.execute(
+                            "UPDATE domains SET project_id = ? WHERE id = ?", (pid, d["id"])
+                        )
+                        stats["unmatched"] += 1
+                    else:
+                        pid = self._project_id_tx(PROJECT_FALLBACK)
+                        self.conn.execute(
+                            "UPDATE domains SET project_id = ? WHERE id = ?", (pid, d["id"])
+                        )
+                        stats["fallback"] += 1
+            return stats
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    # ------------------------------------------------------------------ #
+    # 删除日志 DeletionLog（2026-08-29 增量备份增强：同步"删除"到其他电脑）
+    # ------------------------------------------------------------------ #
+    def _category_name_chain(self, category_id: int) -> List[str]:
+        """分类名称链（从一级到自身）；无父级返回 [自身]"""
+        names = []
+        cid = category_id
+        while cid:
+            c = self.get_category(cid)
+            if not c:
+                break
+            names.append(c["name"])
+            cid = c["parent_id"]
+        return names[::-1]
+
+    def _log_deletion(self, kind: str, name: str = "",
+                      chain: Optional[list] = None,
+                      content_key: str = "") -> None:
+        """写入删除日志（kind: entry/category/domain）"""
+        self.conn.execute(
+            "INSERT INTO deletion_log(kind, name, chain, content_key, deleted_at) "
+            "VALUES(?, ?, ?, ?, ?)",
+            (kind, name, json.dumps(chain or [], ensure_ascii=False),
+             content_key, _now()),
+        )
+
+    def list_deletions_since(self, since: str) -> List[dict]:
+        """自 since（含）以来的删除日志"""
+        rows = self.conn.execute(
+            "SELECT * FROM deletion_log WHERE deleted_at >= ? ORDER BY id", (since,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def prune_deletion_log(self, keep_days: int = 7) -> None:
+        """清理超过保留天数的删除日志（已被增量文件捕获后的历史清理）"""
+        self.conn.execute(
+            "DELETE FROM deletion_log WHERE deleted_at < ?",
+            ((datetime.now() - timedelta(days=keep_days)).strftime("%Y-%m-%d %H:%M:%S"),),
+        )
+        self.conn.commit()
+
+    def find_category_by_chain(self, chain: List[str]) -> Optional[int]:
+        """按名称链（一级/二级…）定位分类 id；任一级不存在返回 None"""
+        cid = None
+        for name in chain:
+            row = self.conn.execute(
+                "SELECT id FROM categories WHERE parent_id IS ? AND name = ?",
+                (cid, name),
+            ).fetchone()
+            if not row:
+                return None
+            cid = row["id"]
+        return cid
+
+    def delete_entries_by_content_key(self, content_key: str,
+                                      cat_id: Optional[int] = None) -> int:
+        """按"详情内容"判重键删除条目（增量删除同步用，尽力而为）。
+        cat_id 指定则仅在该分类及其子树匹配；否则全库匹配。返回删除条数。
+        """
+        ids = []
+        if cat_id is not None:
+            for e in self.list_entries(cat_id, include_descendants=True):
+                if self.content_key(e) == content_key:
+                    ids.append(e["id"])
+        else:
+            for e in self.list_all_entries():
+                if self.content_key(e) == content_key:
+                    ids.append(e["id"])
+        for eid in ids:
+            self.delete_entry(eid)  # 复用删除（含图片清理与删除日志）
+        return len(ids)
+
+    # ------------------------------------------------------------------ #
     # 分类 Category
     # ------------------------------------------------------------------ #
     def add_category(self, name: str, parent_id: Optional[int] = None,
@@ -248,9 +579,11 @@ class Database:
             "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM categories WHERE parent_id IS ?",
             (parent_id,),
         ).fetchone()[0]
+        ts = _now()  # 2026-08-29（增量备份增强）：记录分类创建/修改时间
         cur = self.conn.execute(
-            "INSERT INTO categories(parent_id, name, sort_order) VALUES(?, ?, ?)",
-            (parent_id, name, order),
+            "INSERT INTO categories(parent_id, name, sort_order, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?)",
+            (parent_id, name, order, ts, ts),
         )
         cid = cur.lastrowid
         if parent_id is None and domain_id is not None:
@@ -284,7 +617,11 @@ class Database:
             cid = c["parent_id"]
 
     def rename_category(self, category_id: int, new_name: str) -> None:
-        self.conn.execute("UPDATE categories SET name = ? WHERE id = ?", (new_name, category_id))
+        # 2026-08-29（增量备份增强）：改名更新 updated_at
+        self.conn.execute(
+            "UPDATE categories SET name = ?, updated_at = ? WHERE id = ?",
+            (new_name, _now(), category_id),
+        )
         self.conn.commit()
 
     def get_category(self, category_id: int) -> Optional[dict]:
@@ -344,6 +681,12 @@ class Database:
         返回受影响统计 {'categories': n, 'entries': m}
         """
         stat = self.count_descendants(category_id)
+        # 2026-08-29（增量备份增强）：记录被删分类及其全部子分类的删除日志（含各自名称链）
+        for cid in self._collect_category_ids(category_id):
+            c = self.get_category(cid)
+            if c:
+                self._log_deletion("category", c["name"],
+                                   chain=self._category_name_chain(cid))
         self.conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
         self.conn.commit()
         return stat
@@ -423,6 +766,13 @@ class Database:
         entry = self.get_entry(entry_id)
         if entry and entry.get("image_path"):
             self._remove_image_file(entry["image_path"])  # 同步删除关联图片（尽力而为）
+        # 2026-08-29（增量备份增强）：记录删除日志，供换机同步删除
+        if entry:
+            self._log_deletion(
+                "entry", entry["name"],
+                chain=self._category_name_chain(entry["category_id"]) if entry.get("category_id") else [],
+                content_key=self.content_key(entry),
+            )
         self.conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
         self.conn.commit()
 
@@ -463,6 +813,23 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def count_entries(self, category_id: Optional[int] = None,
+                      include_descendants: bool = False) -> int:
+        """统计条目数（COUNT，不加载行；2026-08-29 复审优化：状态栏悬停高频场景用）"""
+        if category_id is None:
+            return self.conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        if include_descendants:
+            ids = self._collect_category_ids(category_id)
+            if not ids:
+                return 0
+            ph = ",".join("?" * len(ids))
+            return self.conn.execute(
+                f"SELECT COUNT(*) FROM entries WHERE category_id IN ({ph})", ids
+            ).fetchone()[0]
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM entries WHERE category_id = ?", (category_id,)
+        ).fetchone()[0]
+
     def _collect_category_ids(self, category_id: int) -> List[int]:
         ids = []
         stack = [category_id]
@@ -489,6 +856,21 @@ class Database:
 
     def list_all_entries(self) -> List[dict]:
         rows = self.conn.execute("SELECT * FROM entries ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+
+    def list_entries_updated_since(self, since: str) -> List[dict]:
+        """按 updated_at >= since 列出条目（增量备份收集用，2026-08-29 新增）"""
+        rows = self.conn.execute(
+            "SELECT * FROM entries WHERE updated_at >= ? ORDER BY id", (since,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_categories_changed_since(self, since: str) -> List[dict]:
+        """按 created_at/updated_at >= since 列出分类（含"新增空分类"，2026-08-29 新增）"""
+        rows = self.conn.execute(
+            "SELECT * FROM categories WHERE created_at >= ? OR updated_at >= ? "
+            "ORDER BY id", (since, since)
+        ).fetchall()
         return [dict(r) for r in rows]
 
     def search(self, keyword: str) -> List[dict]:
@@ -611,9 +993,11 @@ class Database:
             "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM categories WHERE parent_id IS ?",
             (parent_id,),
         ).fetchone()[0]
+        ts = _now()  # 2026-08-29（增量备份增强）：复制等新建分类记录时间戳
         cur = self.conn.execute(
-            "INSERT INTO categories(parent_id, name, sort_order) VALUES(?, ?, ?)",
-            (parent_id, name, order),
+            "INSERT INTO categories(parent_id, name, sort_order, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?)",
+            (parent_id, name, order, ts, ts),
         )
         cid = cur.lastrowid
         if parent_id is None and new_domain_id is not None:
@@ -662,8 +1046,9 @@ class Database:
                                                          domain_id=target_domain_id)
                     if len(self.linked_domains(l1["id"])) <= 1:
                         # 仅被 A 关联：改名 + 建立与 B 的关联
-                        self.conn.execute("UPDATE categories SET name = ? WHERE id = ?",
-                                          (new_name, l1["id"]))
+                        self.conn.execute(
+                            "UPDATE categories SET name = ?, updated_at = ? WHERE id = ?",
+                            (new_name, _now(), l1["id"]))  # 2026-08-29：改名同步 updated_at
                         self.conn.execute(
                             "INSERT OR IGNORE INTO domain_category(domain_id, category_id) "
                             "VALUES(?, ?)", (target_domain_id, l1["id"]),
@@ -787,8 +1172,9 @@ class Database:
                 for child in self.list_categories(parent_id=category_id):
                     new_name = self.unique_category_name(prefix + child["name"],
                                                          parent_id=target_l1_id)
-                    self.conn.execute("UPDATE categories SET name = ?, parent_id = ? WHERE id = ?",
-                                      (new_name, target_l1_id, child["id"]))
+                    self.conn.execute(
+                        "UPDATE categories SET name = ?, parent_id = ?, updated_at = ? WHERE id = ?",
+                        (new_name, target_l1_id, _now(), child["id"]))  # 2026-08-29：移动同步 updated_at
                     stats["children"] += 1
                 # 2026-08-21（第005条修复）：源一级分类直接挂载的条目先迁移到目标一级分类下，
                 # 避免删除源分类时因外键 ON DELETE SET NULL 转入未分类（复制/移动不删除条目）
@@ -849,8 +1235,9 @@ class Database:
                 raise
         try:
             with self.conn:
-                self.conn.execute("UPDATE categories SET parent_id = NULL WHERE id = ?",
-                                  (category_id,))
+                self.conn.execute(
+                    "UPDATE categories SET parent_id = NULL, updated_at = ? WHERE id = ?",
+                    (_now(), category_id))  # 2026-08-29：提升一级同步 updated_at
                 self.conn.execute(
                     "INSERT OR IGNORE INTO domain_category(domain_id, category_id) VALUES(?, ?)",
                     (target_domain_id, category_id),
@@ -904,8 +1291,9 @@ class Database:
             raise ValueError("目标与当前父级相同")
         try:
             with self.conn:
-                self.conn.execute("UPDATE categories SET parent_id = ? WHERE id = ?",
-                                  (target_l1_id, category_id))
+                self.conn.execute(
+                    "UPDATE categories SET parent_id = ?, updated_at = ? WHERE id = ?",
+                    (target_l1_id, _now(), category_id))  # 2026-08-29：移动同步 updated_at
             return {}
         except Exception:
             self.conn.rollback()
@@ -935,6 +1323,7 @@ class Database:
     # ------------------------------------------------------------------ #
     def stats(self) -> dict:
         return {
+            "projects": self.conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0],
             "domains": self.conn.execute("SELECT COUNT(*) FROM domains").fetchone()[0],
             "categories": self.conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0],
             "entries": self.conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0],
@@ -1152,6 +1541,127 @@ def _selftest() -> None:
         assert any(x["id"] == dom_q for x in db.linked_domains(l1m))
         print("[20] 共享分类移动退化为复制 通过")
 
+        # ---- 21~24：四级分类（2026-08-29 M1 新增）----
+        # 21. 项目类别预置 + 预置根目录自动归属 + 过滤
+        projects = db.list_projects()
+        assert len(projects) == 5
+        pnames = [p["name"] for p in projects]
+        assert pnames == ["日常学习记录", "网上资源收集", "个人梳理资源", "本人创作作品", "个人经验总结"]
+        p_map = {p["name"]: p["id"] for p in projects}
+        dom_by_name = {d["name"]: d for d in db.list_domains()}
+        preset_names = {"计算机编程", "视频", "图像", "音频", "文学", "学术", "专业报告", "视觉风格分类"}
+        existing = set(dom_by_name)
+        # 说明：测试[10]已删除"图像"等根目录，此处仅校验仍存在的预置根目录均已自动归属
+        assert all(dom_by_name[n].get("project_id") is not None
+                   for n in preset_names & existing), "预置根目录应已自动归入项目"
+        assert dom_by_name["视频"]["project_id"] == p_map["日常学习记录"]
+        assert dom_by_name["计算机编程"]["project_id"] == p_map["个人经验总结"]
+        assert dom_by_name["视觉风格分类"]["project_id"] == p_map["个人梳理资源"]
+        # 图像已在[10]删除，仅校验现存预置
+        assert {d["name"] for d in db.list_domains(project_id=p_map["日常学习记录"])} == \
+            {"视频", "音频", "文学", "学术", "专业报告"}
+        print("[21] 项目类别预置/自动归属/过滤 通过")
+
+        # 22. 项目类别增删改 + 删除兜底
+        p_extra = db.add_project("测试项目")
+        assert db.get_project(p_extra)["name"] == "测试项目"
+        db.rename_project(p_extra, "测试项目2")
+        assert db.get_project(p_extra)["name"] == "测试项目2"
+        dom_tmp = db.add_domain("临时域", project_id=p_extra)
+        assert db.get_domain(dom_tmp)["project_id"] == p_extra
+        fallback_id = db.ensure_project("未明确分类")
+        stat = db.delete_project(p_extra, fallback_project_id=fallback_id)
+        assert stat == {"domains": 1}
+        assert db.get_domain(dom_tmp)["project_id"] == fallback_id
+        assert db.get_project(p_extra) is None
+        print("[22] 项目类别增删改/删除兜底 通过")
+
+        # 23. 移动/复制根目录到项目类别
+        p_src = p_map["个人经验总结"]
+        p_dst = p_map["网上资源收集"]
+        dom_m = db.add_domain("移动域", project_id=p_src)
+        db.move_domain_to_project(dom_m, p_dst)
+        assert db.get_domain(dom_m)["project_id"] == p_dst
+        dom_c = db.add_domain("复制域", project_id=p_src)
+        c_l1 = db.add_category("复制一级", domain_id=dom_c)
+        c_l2 = db.add_category("复制二级", parent_id=c_l1)
+        db.add_entry(Entry(name="复制条目", category_id=c_l2))
+        new_id = db.copy_domain_to_project(dom_c, p_dst, db.unique_domain_name("复制域"))
+        assert db.get_domain(new_id)["project_id"] == p_dst
+        assert db.get_domain(dom_c)["project_id"] == p_src  # 源保留
+        new_l1 = db.list_categories(domain_id=new_id, parent_id=None)
+        assert len(new_l1) == 1 and new_l1[0]["name"] == "复制一级"
+        new_l2 = db.list_categories(parent_id=new_l1[0]["id"])
+        assert len(new_l2) == 1 and new_l2[0]["name"] == "复制二级"
+        assert len(db.list_entries(new_l2[0]["id"])) == 1
+        print("[23] 移动/复制根目录到项目类别 通过")
+
+        # 24. assign_domains_to_projects：未命中 → 选择 / 兜底 / 幂等
+        for d in db.list_unassigned_domains():   # 先把测试遗留的无归属根目录隔离
+            db.move_domain_to_project(d["id"], p_src)
+        dom_x = db.add_domain("未知根目录X")
+        dom_y = db.add_domain("未知根目录Y")
+
+        def _choose(name, projects):
+            return "日常学习记录" if name == "未知根目录X" else None
+
+        st = db.assign_domains_to_projects({}, _choose)
+        assert st == {"matched": 0, "unmatched": 1, "fallback": 1}, st
+        fb = db.get_project_by_name("未明确分类")["id"]
+        assert db.get_domain(dom_x)["project_id"] == p_map["日常学习记录"]
+        assert db.get_domain(dom_y)["project_id"] == fb
+        st2 = db.assign_domains_to_projects({}, _choose)   # 幂等：无新变化
+        assert st2 == {"matched": 0, "unmatched": 0, "fallback": 0}
+        print("[24] 归属分配/未命中兜底/幂等 通过")
+
+        # ---- 25~27：增量备份增强（2026-08-29）----
+        # 25. 分类时间戳：新建/改名/移动会写入 created_at/updated_at
+        ts_cat = db.add_category("时间戳分类", domain_id=p_src)
+        c_row = db.get_category(ts_cat)
+        assert c_row["created_at"] and c_row["updated_at"], "新建分类应带时间戳"
+        db.rename_category(ts_cat, "时间戳分类2")
+        assert db.get_category(ts_cat)["updated_at"] >= c_row["updated_at"]
+        today_start = datetime.now().strftime("%Y-%m-%d 00:00:00")
+        changed = db.list_categories_changed_since(today_start)
+        assert any(x["id"] == ts_cat for x in changed), "当日新建分类应被 list_categories_changed_since 命中"
+        print("[25] 分类时间戳/当日变更查询 通过")
+
+        # 26. 删除日志：条目/分类(级联)/根目录
+        e_del = db.add_entry(Entry(name="待删条目", category_id=c_l2))
+        db.delete_entry(e_del)
+        logs = db.list_deletions_since(today_start)
+        entry_log = [x for x in logs if x["kind"] == "entry" and x["name"] == "待删条目"]
+        assert entry_log and entry_log[0]["content_key"], "删除条目应记录内容键"
+        # 删除分类（含子分类级联日志）
+        cat_del = db.add_category("待删一级", domain_id=p_src)
+        cat_del2 = db.add_category("待删二级", parent_id=cat_del)
+        db.delete_category(cat_del)
+        cat_logs = [x for x in db.list_deletions_since(today_start)
+                    if x["kind"] == "category"]
+        assert any(x["name"] == "待删一级" and json.loads(x["chain"]) == ["待删一级"]
+                   for x in cat_logs)
+        assert any(x["name"] == "待删二级" and json.loads(x["chain"]) == ["待删一级", "待删二级"]
+                   for x in cat_logs)
+        # 删除根目录日志
+        dom_del = db.add_domain("待删根目录")
+        db.delete_domain(dom_del)
+        assert any(x["kind"] == "domain" and x["name"] == "待删根目录"
+                   for x in db.list_deletions_since(today_start))
+        print("[26] 删除日志（条目/分类级联/根目录）通过")
+
+        # 27. find_category_by_chain + delete_entries_by_content_key
+        ch_l1 = db.add_category("链一级", domain_id=p_src)
+        ch_l2 = db.add_category("链二级", parent_id=ch_l1)
+        e1 = db.add_entry(Entry(name="同内容", intro="X", category_id=ch_l2))
+        e2 = db.add_entry(Entry(name="同内容", intro="X", category_id=ch_l2))
+        assert db.find_category_by_chain(["链一级", "链二级"]) == ch_l2
+        assert db.find_category_by_chain(["链一级", "不存在"]) is None
+        k = Database.content_key(db.get_entry(e1))
+        n = db.delete_entries_by_content_key(k, cat_id=ch_l2)
+        assert n == 2, n   # 内容键相同的两条都被删除
+        assert db.get_entry(e1) is None and db.get_entry(e2) is None
+        print("[27] 按名称链查找/按内容键删除 通过")
+
         print(f"[统计] {db.stats()}")
         print("=== 数据库层全部自测通过 ===")
     finally:
@@ -1159,5 +1669,71 @@ def _selftest() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _migrate_selftest() -> None:
+    """v2 → v3 迁移自测：结构升级 + 归属分配 + 兜底 + 幂等（在临时 v2 库上进行）"""
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="promptsprite_migrate_")
+    try:
+        v2 = os.path.join(tmp, "v2.db")
+        conn = sqlite3.connect(v2)
+        conn.executescript("""
+            CREATE TABLE domains (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE, sort_order INTEGER DEFAULT 0);
+            CREATE TABLE categories (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_id INTEGER DEFAULT NULL, name TEXT NOT NULL, sort_order INTEGER DEFAULT 0);
+            CREATE TABLE domain_category (domain_id INTEGER NOT NULL,
+                category_id INTEGER NOT NULL, PRIMARY KEY (domain_id, category_id));
+            CREATE TABLE entries (id INTEGER PRIMARY KEY AUTOINCREMENT, category_id INTEGER,
+                name TEXT NOT NULL, intro TEXT DEFAULT '', origin TEXT DEFAULT '',
+                features TEXT DEFAULT '', scenes TEXT DEFAULT '', works TEXT DEFAULT '',
+                image_desc TEXT DEFAULT '', prompt_cn TEXT DEFAULT '', prompt_en TEXT DEFAULT '',
+                image_plan TEXT DEFAULT '', image_path TEXT DEFAULT '',
+                is_favorite INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT);
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+        """)
+        conn.execute("INSERT INTO meta(key,value) VALUES('schema_version','2')")
+        conn.executemany("INSERT INTO domains(name, sort_order) VALUES(?,?)",
+                         [("视频", 0), ("计算机编程", 1), ("未知根目录", 2)])
+        conn.execute("INSERT INTO categories(parent_id,name,sort_order) VALUES(NULL,'一级A',0)")
+        conn.execute("INSERT INTO categories(parent_id,name,sort_order) VALUES(1,'二级B',0)")
+        conn.execute("INSERT INTO entries(category_id,name) VALUES(2,'迁移条目')")
+        conn.commit()
+        conn.close()
+
+        db = Database(v2)  # 触发结构迁移 v2→v3
+        try:
+            assert db.get_meta("schema_version") == "3"
+            assert db._has_column("domains", "project_id")
+            assert len(db.list_projects()) == 5
+            assert db.get_entry(1)["name"] == "迁移条目"  # 数据无损
+            # 归属分配：全命中 + 未知根目录未回答 → 兜底"未明确分类"
+            st = db.assign_domains_to_projects(PROJECT_DOMAIN_MAPPING)
+            assert st["matched"] == 2, st
+            assert st["unmatched"] == 0 and st["fallback"] == 1
+            p_map = {p["name"]: p["id"] for p in db.list_projects()}
+            assert db.get_domain(1)["project_id"] == p_map["日常学习记录"]   # 视频
+            assert db.get_domain(2)["project_id"] == p_map["个人经验总结"]   # 计算机编程
+            assert db.get_domain(3)["project_id"] == db.get_project_by_name("未明确分类")["id"]
+            # 幂等：重跑不再产生变化
+            st2 = db.assign_domains_to_projects({}, None)
+            assert st2 == {"matched": 0, "unmatched": 0, "fallback": 0}, st2
+            print("[迁移] v2→v3 结构升级/归属分配/兜底/幂等 通过")
+        finally:
+            db.close()
+        # 幂等：重开库不再重复迁移
+        db2 = Database(v2)
+        try:
+            assert db2.get_meta("schema_version") == "3"
+            assert len(db2.list_projects()) == 6  # 5 预置 + 未明确分类
+            print("[迁移] 重开幂等 通过")
+        finally:
+            db2.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     _selftest()
+    _migrate_selftest()

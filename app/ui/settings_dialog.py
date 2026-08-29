@@ -30,6 +30,12 @@ class SettingsDialog(ctk.CTkToplevel):
         self._remember = db.get_meta(config.META_REMEMBER_SIZE) != "0"
         self._view_mode = db.get_meta(config.META_VIEW_MODE) or "card"
         self._detail_mode = db.get_meta(config.META_DETAIL_MODE) or config.DETAIL_MODE_AUTO
+        self._computer_code = db.get_meta(config.META_COMPUTER_CODE) or ""
+        try:
+            self._incr_keep_days = int(db.get_meta(config.META_INCR_KEEP_DAYS)
+                                       or config.INCR_KEEP_DAYS)
+        except (TypeError, ValueError):
+            self._incr_keep_days = config.INCR_KEEP_DAYS
 
         self._build()
         self._center()
@@ -69,9 +75,27 @@ class SettingsDialog(ctk.CTkToplevel):
                      text_color="gray", justify="left", font=("Microsoft YaHei", 11)
                      ).grid(row=4, column=0, columnspan=2, padx=pad, pady=(0, 4), sticky="w")
 
+        # 4. 电脑代号（增量备份文件名区分多机，2026-08-29 M4 新增）
+        ctk.CTkLabel(self, text="电脑代号",
+                     font=("Microsoft YaHei", 13)).grid(row=5, column=0, padx=pad, pady=8, sticky="w")
+        self.entry_code = ctk.CTkEntry(self, placeholder_text="默认取主机名")
+        self.entry_code.grid(row=5, column=1, padx=pad, pady=8, sticky="ew")
+        if self._computer_code:
+            self.entry_code.insert(0, self._computer_code)
+        ctk.CTkLabel(self, text="用于增量备份文件名区分不同电脑，可随时修改",
+                     text_color="gray", font=("Microsoft YaHei", 11)
+                     ).grid(row=6, column=0, columnspan=2, padx=pad, pady=(0, 4), sticky="w")
+
+        # 5. 增量备份保留天数（2026-08-29 M4 新增）
+        ctk.CTkLabel(self, text="增量保留天数",
+                     font=("Microsoft YaHei", 13)).grid(row=7, column=0, padx=pad, pady=8, sticky="w")
+        self.entry_keep = ctk.CTkEntry(self, width=120)
+        self.entry_keep.grid(row=7, column=1, padx=pad, pady=8, sticky="w")
+        self.entry_keep.insert(0, str(self._incr_keep_days))
+
         # 按钮
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
-        btn_row.grid(row=5, column=0, columnspan=2, sticky="e", padx=pad, pady=(8, 16))
+        btn_row.grid(row=8, column=0, columnspan=2, sticky="e", padx=pad, pady=(8, 16))
         ctk.CTkButton(btn_row, text="ℹ 关于", width=96, fg_color="#8a94a6",  # 2026-08-21（第006条）：关于入口
                       command=self._show_about).pack(side="left", padx=4)
         ctk.CTkButton(btn_row, text="确定", width=96, fg_color="#2E8B57",
@@ -88,16 +112,21 @@ class SettingsDialog(ctk.CTkToplevel):
         win.grab_set()
         info = (
             f"{config.APP_NAME} · 提示精灵\n"
-            f"版本 V{config.APP_VERSION}（2026-08-22 发布）\n"
+            f"版本 V{config.APP_VERSION}（2026-08-29 发布）\n"
             "──────────────────────────\n"
             "本地优先的 AI 提示词管理工具：\n"
-            "· 四级分类书架（根目录/分类/子分类/条目），极速检索\n"
+            "· 五级分类书架（项目类别/根目录/分类/子分类/条目）\n"
+            "· 内置数据：5 项目类别 · 14 根目录 · 3934 条提示词\n"
+            "· 老版本数据自动/引导迁移（未明确分类兜底）\n"
+            "· 每日增量备份（按电脑代号区分，可换机合并导入）\n"
+            "· 增量备份覆盖 增/删/改/空分类 全同步\n"
             "· 一键复制 / 快速新建 / 全局热键 Ctrl+Shift+P 唤起\n"
             "· JSON / Excel / Markdown / HTML 多格式导入导出\n"
-            "· 自动备份（保留最近 5 份），数据 100% 本机存储，无任何联网行为\n"
+            "· 自动全量备份（保留最近 5 份），数据 100% 本机存储，无任何联网行为\n"
             "──────────────────────────\n"
             "技术栈：Python 3.12 · CustomTkinter · SQLite\n"
             "数据文件：data/prompts.db（随软件目录整体迁移即可换机使用）\n"
+            "开源仓库：GitHub（MIT License，欢迎 Star / Issue）\n"
             "© 2026 PromptSprite 开发组 · 仅供学习与个人使用"
         )
         ctk.CTkLabel(win, text=info, font=("Microsoft YaHei", 13),
@@ -123,6 +152,14 @@ class SettingsDialog(ctk.CTkToplevel):
                  "精简": config.DETAIL_MODE_COMPACT}
         self.db.set_meta(config.META_DETAIL_MODE, _rmap.get(self.seg_detail.get(),
                                                            config.DETAIL_MODE_AUTO))
+        # 电脑代号（增量备份区分多机，2026-08-29 M4）
+        code = self.entry_code.get().strip()
+        if code:
+            self.db.set_meta(config.META_COMPUTER_CODE, code)
+        # 增量备份保留天数（2026-08-29 M4）
+        keep = self.entry_keep.get().strip()
+        if keep.isdigit() and int(keep) >= 1:
+            self.db.set_meta(config.META_INCR_KEEP_DAYS, str(int(keep)))
         if hasattr(self.master, "apply_settings"):
             self.master.apply_settings()
         self.destroy()

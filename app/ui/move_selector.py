@@ -58,14 +58,23 @@ class MoveSelector(ctk.CTkToplevel):
         self.lift()
 
     def _build_tree(self) -> None:
-        for d in self.db.list_domains():
-            did = self.tree.insert("", "end", text=d["name"], open=True)
-            for l1 in self.db.list_categories(domain_id=d["id"], parent_id=None):
-                l1_id = self.tree.insert(did, "end", text=l1["name"], open=True)
-                self._iid_to_cat[l1_id] = l1["id"]
-                for l2 in self.db.list_categories(parent_id=l1["id"]):
-                    l2_id = self.tree.insert(l1_id, "end", text=l2["name"])
-                    self._iid_to_cat[l2_id] = l2["id"]
+        # 2026-08-29（M3）：树形目标按 项目类别 → 根目录 → 一级 → 二级 分组
+        for p in self.db.list_projects():
+            pid = self.tree.insert("", "end", text=p["name"], open=True)
+            for d in self.db.list_domains(project_id=p["id"]):
+                self._insert_domain(pid, d)
+        # 未分配根目录（无归属）
+        for d in self.db.list_unassigned_domains():
+            self._insert_domain("", d, suffix="（未分配）")
+
+    def _insert_domain(self, parent, d: dict, suffix: str = "") -> None:
+        did = self.tree.insert(parent, "end", text=f"{d['name']}{suffix}", open=True)
+        for l1 in self.db.list_categories(domain_id=d["id"], parent_id=None):
+            l1_id = self.tree.insert(did, "end", text=l1["name"], open=True)
+            self._iid_to_cat[l1_id] = l1["id"]
+            for l2 in self.db.list_categories(parent_id=l1["id"]):
+                l2_id = self.tree.insert(l1_id, "end", text=l2["name"])
+                self._iid_to_cat[l2_id] = l2["id"]
 
     def _pick_uncategorized(self):
         self.result = "uncategorized"

@@ -15,7 +15,7 @@ build.py - PromptSprite 一键打包脚本（单 EXE）
 说明：
   - 优先使用 .venv 的 Python 打包（依赖已齐备）；无 .venv 时使用当前解释器。
   - 打包产物为单文件：dist/PromptSprite.exe（内置手册、图标、完整最新数据库一并内嵌）。
-  - 每次打包均携带开发态最新数据（3816 条等），保证 EXE 开箱即用最新内容。
+  - 每次打包均携带开发态最新数据（3934 条等），保证 EXE 开箱即用最新内容。
 """
 import os
 import shutil
