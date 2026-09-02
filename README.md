@@ -161,5 +161,18 @@ PromptSprite/
 4. 提交遵循 [Conventional Commits](https://www.conventionalcommits.org/) 规范；
 5. 发起 Pull Request。
 
+
+---
+
+## 爱心打赏
+
+☕ 如果你开心，欢迎送爱心请作者喝杯咖啡，让我更有动力去创造！
+<p align="center">
+  <img src="https://github.com/yihufree/XueYuTTS/blob/main/images/wechatpay_203903.png" alt="爱心 微信赞赏码" width="240">
+</p>
+
+---
+
+
 ## 📄 许可证
 本项目采用 **MIT License**（见 [LICENSE](LICENSE)）。引用本项目或代码请保留版权声明。
