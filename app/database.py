@@ -14,12 +14,13 @@ database.py - PromptSprite SQLite 数据访问层
 import json  # 2026-08-29（增量备份增强）：删除日志名称链序列化
 import os
 import re
+import shutil  # 2026-09-07：条目"复制到"独立副本时复制关联图片文件
 import sqlite3
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from .config import (data_dir, PRESET_DOMAINS, PROJECT_PRESETS, PROJECT_FALLBACK,
-                     PROJECT_DOMAIN_MAPPING)
+from .config import (data_dir, IMAGES_DIR_NAME, PRESET_DOMAINS, PROJECT_PRESETS,
+                     PROJECT_FALLBACK, PROJECT_DOMAIN_MAPPING)
 from .models import Entry  # 2026-08-18（P2-5）：Domain/Category 冗余数据类已删除，仅保留 Entry
 
 
@@ -96,11 +97,22 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT
 );
 
+-- 2026-09-07（条目多位置施工）：条目与分类的"额外关联"（entry_links）。
+-- 主挂靠仍存 entries.category_id；本表只存"额外位置"，两表取并集即条目全部可见位置。
+-- 任一表被删除行时级联清理（避免悬空关联）。
+CREATE TABLE IF NOT EXISTS entry_links (
+    entry_id    INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    created_at  TEXT,
+    PRIMARY KEY (entry_id, category_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_categories_parent  ON categories(parent_id);
 CREATE INDEX IF NOT EXISTS idx_dc_domain          ON domain_category(domain_id);
 CREATE INDEX IF NOT EXISTS idx_dc_category        ON domain_category(category_id);
 CREATE INDEX IF NOT EXISTS idx_entries_category   ON entries(category_id);
 CREATE INDEX IF NOT EXISTS idx_entries_favorite   ON entries(is_favorite);
+CREATE INDEX IF NOT EXISTS idx_entry_links_cat    ON entry_links(category_id);
 """
 
 # 数据库结构版本（meta 键 schema_version）；v1=旧版按领域归属分类，v2=全局分类+领域关联，v3=四级分类（项目类别）
@@ -148,7 +160,7 @@ class Database:
         self._ensure_v3_enhancements()
 
     def _ensure_v3_enhancements(self) -> None:
-        """v3 增量备份增强（幂等）：categories 时间戳列 + deletion_log 表。
+        """v3 增量备份增强（幂等）：categories 时间戳列 + deletion_log 表 + entry_links 表。
         历史分类回填为固定旧时间戳（1970-01-01），保证首次增量不误报存量分类。
         """
         if not self._has_column("categories", "created_at"):
@@ -162,6 +174,15 @@ class Database:
             " id INTEGER PRIMARY KEY AUTOINCREMENT,"
             " kind TEXT NOT NULL, name TEXT DEFAULT '', chain TEXT DEFAULT '',"
             " content_key TEXT DEFAULT '', deleted_at TEXT)")
+        # 2026-09-07（条目多位置施工）：存量库幂等补建 entry_links 表 + 索引
+        self.conn.executescript(
+            "CREATE TABLE IF NOT EXISTS entry_links ("
+            " entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,"
+            " category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,"
+            " created_at TEXT,"
+            " PRIMARY KEY (entry_id, category_id))")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entry_links_cat ON entry_links(category_id)")
         # 回填：旧数据无时间戳 → 设为固定旧时间（不在任何"今日"范围内）；
         # 2026-08-29（复审优化）：仅当存在空值时执行，避免每次打开全表 UPDATE
         if self.conn.execute(
@@ -796,26 +817,45 @@ class Database:
             pass
 
     def list_entries(self, category_id: int, include_descendants: bool = False) -> List[dict]:
-        """列出某分类下的条目；include_descendants=True 时含所有子分类条目"""
+        """列出某分类可见条目（主挂靠=该分类 ∪ 关联表含该分类，去重）。
+
+        include_descendants=True 时含所有子分类子树内的可见条目。
+        2026-09-07（条目多位置施工）：单分类列举由"只看 category_id"改为两路并集，
+        使"关联到"的条目也能在对应分类下列出。
+        """
         if include_descendants:
             ids = self._collect_category_ids(category_id)
             if not ids:
                 return []
             ph = ",".join("?" * len(ids))
             rows = self.conn.execute(
-                f"SELECT * FROM entries WHERE category_id IN ({ph}) ORDER BY updated_at DESC, id",
-                ids,
+                "SELECT * FROM ("
+                f" SELECT e.* FROM entries e WHERE e.category_id IN ({ph})"
+                " UNION "
+                f" SELECT e.* FROM entries e JOIN entry_links l ON l.entry_id = e.id"
+                f"  WHERE l.category_id IN ({ph})"
+                ") ORDER BY updated_at DESC, id",
+                ids + ids,
             ).fetchall()
         else:
             rows = self.conn.execute(
-                "SELECT * FROM entries WHERE category_id = ? ORDER BY updated_at DESC, id",
-                (category_id,),
+                "SELECT * FROM ("
+                " SELECT e.* FROM entries e WHERE e.category_id = ?"
+                " UNION "
+                " SELECT e.* FROM entries e JOIN entry_links l ON l.entry_id = e.id"
+                "  WHERE l.category_id = ?"
+                ") ORDER BY updated_at DESC, id",
+                (category_id, category_id),
             ).fetchall()
         return [dict(r) for r in rows]
 
     def count_entries(self, category_id: Optional[int] = None,
                       include_descendants: bool = False) -> int:
-        """统计条目数（COUNT，不加载行；2026-08-29 复审优化：状态栏悬停高频场景用）"""
+        """统计某分类可见条目数（COUNT，不加载行）。
+
+        2026-09-07（条目多位置施工）：改为按并集统计"位置可见条目数"；
+        category_id=None 仍返回全局物理条目总数（不重复计关联）。
+        """
         if category_id is None:
             return self.conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
         if include_descendants:
@@ -824,10 +864,22 @@ class Database:
                 return 0
             ph = ",".join("?" * len(ids))
             return self.conn.execute(
-                f"SELECT COUNT(*) FROM entries WHERE category_id IN ({ph})", ids
+                "SELECT COUNT(*) FROM ("
+                f" SELECT e.id FROM entries e WHERE e.category_id IN ({ph})"
+                " UNION "
+                f" SELECT e.id FROM entries e JOIN entry_links l ON l.entry_id = e.id"
+                f"  WHERE l.category_id IN ({ph})"
+                ")",
+                ids + ids,
             ).fetchone()[0]
         return self.conn.execute(
-            "SELECT COUNT(*) FROM entries WHERE category_id = ?", (category_id,)
+            "SELECT COUNT(*) FROM ("
+            " SELECT e.id FROM entries e WHERE e.category_id = ?"
+            " UNION "
+            " SELECT e.id FROM entries e JOIN entry_links l ON l.entry_id = e.id"
+            "  WHERE l.category_id = ?"
+            ")",
+            (category_id, category_id),
         ).fetchone()[0]
 
     def _collect_category_ids(self, category_id: int) -> List[int]:
@@ -843,8 +895,15 @@ class Database:
         return ids
 
     def list_uncategorized(self) -> List[dict]:
+        """列出未分类条目：主挂靠为空 **且** 无任何关联位置。
+
+        2026-09-07（条目多位置施工）：若条目经 entry_links 关联到某分类，
+        即使 category_id 为空也不再视为"未分类"。
+        """
         rows = self.conn.execute(
-            "SELECT * FROM entries WHERE category_id IS NULL ORDER BY updated_at DESC, id"
+            "SELECT * FROM entries WHERE category_id IS NULL "
+            "AND id NOT IN (SELECT entry_id FROM entry_links) "
+            "ORDER BY updated_at DESC, id"
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -893,13 +952,259 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def move_entry(self, entry_id: int, category_id: Optional[int]) -> None:
-        """移动条目到指定分类；category_id=None 表示移入未分类"""
+    # ------------------------------------------------------------------ #
+    # 条目多位置：关联 / 复制 / 移动（2026-09-07 施工）
+    # 统一原语 set_entry_locations：关联=add；解除=remove；移动=remove(全部)+add(目标)
+    # 不变量：条目只要有位置，主挂靠(category_id)恰为其一；位置清空则 category_id=NULL。
+    # ------------------------------------------------------------------ #
+    def _entry_location_ids(self, entry_id: int) -> List[int]:
+        """条目当前全部位置分类 id（主挂靠 + 关联，去重、升序）"""
+        e = self.get_entry(entry_id)
+        ids = []
+        if e and e.get("category_id") is not None:
+            ids.append(e["category_id"])
+        rows = self.conn.execute(
+            "SELECT category_id FROM entry_links WHERE entry_id = ? "
+            "ORDER BY created_at, rowid", (entry_id,)
+        ).fetchall()
+        for r in rows:
+            if r["category_id"] not in ids:
+                ids.append(r["category_id"])
+        return ids
+
+    def list_entry_locations(self, entry_id: int) -> List[int]:
+        """条目全部位置分类 id（含主挂靠；供 UI 位置提示/移动对话框用）"""
+        return self._entry_location_ids(entry_id)
+
+    def _entry_location_apply_tx(self, entry_id: int, remove: List[int],
+                                 add: List[int]) -> None:
+        """位置编辑核心（须在调用方事务内执行，不自行 commit）。
+
+        规则：
+        1) add 的目标若已在任一位置则忽略；
+        2) remove 同时作用于 主挂靠 与 关联表；
+        3) 主挂靠被移除后，若仍有剩余关联位置则自动提升其一为主挂靠；
+        4) 全部位置清空 → category_id=NULL（回落未分类）。
+        """
+        e = self.get_entry(entry_id)
+        if not e:
+            raise ValueError("条目不存在")
+        main = e["category_id"]
+        now = set(self._entry_location_ids(entry_id))
+        for cid in dict.fromkeys(remove or []):
+            if cid is None or cid not in now:
+                continue
+            now.discard(cid)
+            self.conn.execute(
+                "DELETE FROM entry_links WHERE entry_id = ? AND category_id = ?",
+                (entry_id, cid))
+        for cid in dict.fromkeys(add or []):
+            if cid is None or cid in now:
+                continue
+            now.add(cid)
+            self.conn.execute(
+                "INSERT INTO entry_links(entry_id, category_id, created_at) "
+                "VALUES(?, ?, ?)", (entry_id, cid, _now()))
+        # 主挂靠维护：main 是否还在剩余位置中
+        if main is not None and main not in now:
+            main = None
+        if main is None and now:
+            main = min(now)  # 提升最小 id 的关联位置为主挂靠
+            self.conn.execute(
+                "DELETE FROM entry_links WHERE entry_id = ? AND category_id = ?",
+                (entry_id, main))
         self.conn.execute(
             "UPDATE entries SET category_id = ?, updated_at = ? WHERE id = ?",
-            (category_id, _now(), entry_id),
-        )
-        self.conn.commit()
+            (main, _now(), entry_id))
+
+    def set_entry_locations(self, entry_id: int, remove: Optional[list] = None,
+                            add: Optional[list] = None) -> None:
+        """统一位置编辑原语（原子）。remove/add 为分类 id 列表。"""
+        try:
+            with self.conn:
+                self._entry_location_apply_tx(entry_id, remove or [], add or [])
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def link_entry(self, entry_id: int, category_id: int) -> None:
+        """把条目关联到某分类（若该分类已是主挂靠则忽略）"""
+        self.set_entry_locations(entry_id, remove=[], add=[category_id])
+
+    def unlink_entry(self, entry_id: int, category_id: int) -> None:
+        """解除条目在某分类的关联（含解除主挂靠；仅剩位置会自动提升）"""
+        self.set_entry_locations(entry_id, remove=[category_id], add=[])
+
+    def move_entry(self, entry_id: int, category_id: Optional[int]) -> None:
+        """把条目整体转移：仅保留目标位置（清空其它全部关联）。
+
+        category_id=None 表示移入未分类。兼容旧调用（单位置对象行为不变）；
+        2026-09-07：多位置下"移动到"＝ remove(全部位置) + add(目标)。
+        """
+        self.set_entry_locations(entry_id,
+                                 remove=self._entry_location_ids(entry_id),
+                                 add=[] if category_id is None else [category_id])
+
+    def copy_entry_to(self, entry_id: int, target_cat_id: int,
+                      new_name: Optional[str] = None) -> int:
+        """"复制到（独立副本）"：将条目内容拷贝到目标分类成为独立新条目。
+
+        - 内容 9 字段全拷贝、收藏清零、时间戳新建；
+        - 关联图片复制为新文件（entry_{新id}.{ext}），避免删除一份误删另一份；
+        - 新条目不带任何额外关联（只有目标主挂靠）。
+        - 名称：目标分类下同名自动加"（副本）/（副本2）…"（2026-09-07，便于区分）。
+        返回新条目 id。
+        """
+        e = self.get_entry(entry_id)
+        if not e:
+            raise ValueError("条目不存在")
+        ts = _now()
+        try:
+            with self.conn:
+                name = new_name or self.unique_entry_name(e["name"], target_cat_id)
+                cur = self.conn.execute(
+                    "INSERT INTO entries(category_id, name, intro, origin, features, scenes, "
+                    "works, image_desc, prompt_cn, prompt_en, image_plan, image_path, "
+                    "is_favorite, created_at, updated_at) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (target_cat_id, name, e["intro"], e["origin"], e["features"],
+                     e["scenes"], e["works"], e["image_desc"], e["prompt_cn"],
+                     e["prompt_en"], e["image_plan"], e["image_path"], 0, ts, ts))
+                new_id = cur.lastrowid
+                if e.get("image_path"):
+                    new_rel = self._copy_image_file(e["image_path"], new_id)
+                    if new_rel:
+                        self.conn.execute(
+                            "UPDATE entries SET image_path = ? WHERE id = ?",
+                            (new_rel, new_id))
+            return new_id
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def _copy_image_file(self, old_rel: str, new_entry_id: int) -> Optional[str]:
+        """复制条目图片到新条目名下（相对 data/ 路径安全校验；失败返回 None）"""
+        try:
+            root = os.path.abspath(data_dir())
+            src = os.path.abspath(os.path.join(root, old_rel))
+            if os.path.commonpath([root, src]) != root or not os.path.isfile(src):
+                return None
+            ext = os.path.splitext(old_rel)[1] or ""
+            img_dir = os.path.join(root, IMAGES_DIR_NAME)
+            os.makedirs(img_dir, exist_ok=True)
+            dest_rel = os.path.join(IMAGES_DIR_NAME, f"entry_{new_entry_id}{ext}")
+            shutil.copy2(src, os.path.join(root, dest_rel))
+            return dest_rel
+        except (OSError, ValueError):
+            return None
+
+    # ---- 保存一致性提示 / 副本命名辅助（2026-09-07） ----
+    def find_content_duplicates(self, key: str,
+                                exclude_entry_id: Optional[int] = None,
+                                limit: int = 5) -> List[dict]:
+        """按"详情内容键"查找同内容条目（用于保存前轻提示；可排除自身）。
+
+        返回最多 limit 条 {"id", "name"}；全库逐条比对（保存频率低，量级可接受）。
+        """
+        hits = []
+        for row in self.conn.execute("SELECT * FROM entries").fetchall():
+            e = dict(row)
+            if exclude_entry_id is not None and e["id"] == exclude_entry_id:
+                continue
+            if self.content_key(e) == key:
+                hits.append({"id": e["id"], "name": e["name"]})
+                if len(hits) >= limit:
+                    break
+        return hits
+
+    def _entry_name_exists(self, name: str, category_id: int) -> bool:
+        """某分类（主挂靠或关联）下是否已存在同名条目"""
+        row = self.conn.execute(
+            "SELECT 1 FROM entries WHERE category_id = ? AND name = ? LIMIT 1",
+            (category_id, name),
+        ).fetchone()
+        if row:
+            return True
+        row = self.conn.execute(
+            "SELECT 1 FROM entry_links l JOIN entries e ON e.id = l.entry_id "
+            "WHERE l.category_id = ? AND e.name = ? LIMIT 1",
+            (category_id, name),
+        ).fetchone()
+        return row is not None
+
+    def unique_entry_name(self, name: str, category_id: int) -> str:
+        """目标分类下条目名去重：重名 → name（副本）→ name（副本2）…"""
+        if not self._entry_name_exists(name, category_id):
+            return name
+        base = f"{name}（副本）"
+        if not self._entry_name_exists(base, category_id):
+            return base
+        i = 2
+        while self._entry_name_exists(f"{name}（副本{i}）", category_id):
+            i += 1
+        return f"{name}（副本{i}）"
+
+    # ------------------------------------------------------------------ #
+    # 分类删除保护（2026-09-07 施工，DB 层；UI 短语输入在阶段 3 接入）
+    # ------------------------------------------------------------------ #
+    _CASCADE_PHRASE = "删除全部下级内容"
+
+    def delete_category_safe(self, category_id: int) -> dict:
+        """安全删除单个分类：拒绝有子分类；其直挂条目仅解除本分类位置，
+        无其它位置的条目转未分类，不真删任何条目。返回 {'categories','entries'}。
+        """
+        if self.category_has_children(category_id):
+            raise ValueError("该分类仍有下级分类，请先处理下级（或改用级联删除）")
+        entries = [e["id"] for e in self.list_entries(category_id)]
+        try:
+            with self.conn:
+                for eid in entries:
+                    self._entry_location_apply_tx(eid, remove=[category_id], add=[])
+                c = self.get_category(category_id)
+                if c:
+                    self._log_deletion("category", c["name"],
+                                       chain=self._category_name_chain(category_id))
+                self.conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+            return {"categories": 1, "entries": len(entries)}
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_category_cascade(self, category_id: int, confirm_phrase: str) -> dict:
+        """级联删除整棵（该分类 + 全部下级分类 + 其全部直挂条目真删）。
+
+        必须传入确认短语并等于 _CASCADE_PHRASE 才执行（DB 层兜底防误删）。
+        返回 {'categories','entries'}（entries 为物理删除数）。
+        """
+        if confirm_phrase != self._CASCADE_PHRASE:
+            raise ValueError("确认短语不正确，已取消级联删除")
+        ids = self._collect_category_ids(category_id)
+        if not ids:
+            return {"categories": 0, "entries": 0}
+        ph = ",".join("?" * len(ids))
+        affected = [r["id"] for r in self.conn.execute(
+            "SELECT e.id FROM entries e WHERE e.category_id IN (" + ph + ")"
+            " UNION "
+            "SELECT l.entry_id AS id FROM entry_links l WHERE l.category_id IN (" + ph + ")",
+            ids + ids,
+        ).fetchall()]
+        try:
+            # 先真删直挂条目（含图片与删除日志，各自提交）
+            for eid in affected:
+                self.delete_entry(eid)
+            # 记录分类删除日志
+            for cid in ids:
+                c = self.get_category(cid)
+                if c:
+                    self._log_deletion("category", c["name"],
+                                       chain=self._category_name_chain(cid))
+            self.conn.execute(
+                "DELETE FROM categories WHERE id IN (" + ph + ")", ids)
+            self.conn.commit()
+            return {"categories": len(ids), "entries": len(affected)}
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def toggle_favorite(self, entry_id: int) -> int:
         """切换收藏状态，返回新状态(0/1)"""
@@ -1661,6 +1966,79 @@ def _selftest() -> None:
         assert n == 2, n   # 内容键相同的两条都被删除
         assert db.get_entry(e1) is None and db.get_entry(e2) is None
         print("[27] 按名称链查找/按内容键删除 通过")
+
+        # ---- 28~30：条目多位置 / 复制到 / 删除保护（2026-09-07 施工）----
+        # 28. 关联/解除/统一原语/整体转移/未分类回落
+        pj_id = db.list_projects()[0]["id"]
+        dom_m = db.add_domain("多位置域", project_id=pj_id)
+        la = db.add_category("AA", domain_id=dom_m)
+        lb = db.add_category("BB", domain_id=dom_m)
+        lc = db.add_category("CC", parent_id=la)
+        ld = db.add_category("DD", parent_id=lb)
+        m1 = db.add_entry(Entry(name="多位置条目", category_id=lc, prompt_cn="P1"))
+        db.link_entry(m1, ld)
+        assert set(db.list_entry_locations(m1)) == {lc, ld}
+        assert len(db.list_entries(ld)) == 1 and db.count_entries(ld) == 1
+        assert all(x["id"] != m1 for x in db.list_uncategorized())
+        db.unlink_entry(m1, ld)
+        assert db.list_entry_locations(m1) == [lc] and db.count_entries(ld) == 0
+        # 统一原语：add 两处 + remove 主挂靠 lc → 提升剩余其一为主挂靠
+        db.set_entry_locations(m1, remove=[lc], add=[lb, ld])
+        assert set(db.list_entry_locations(m1)) == {lb, ld}
+        assert db.get_entry(m1)["category_id"] == min(lb, ld)
+        # 整体转移 move_entry → 仅保留目标
+        db.move_entry(m1, lb)
+        assert db.list_entry_locations(m1) == [lb]
+        assert db.count_entries(lb) == 1 and db.count_entries(ld) == 0
+        # 唯一位置解除 → 未分类
+        db.unlink_entry(m1, lb)
+        assert db.list_entry_locations(m1) == []
+        assert db.get_entry(m1)["category_id"] is None
+        assert any(x["id"] == m1 for x in db.list_uncategorized())
+        print("[28] 条目多位置 关联/解除/统一原语/整体转移 通过")
+
+        # 29. 复制到（独立副本）：内容拷贝、收藏清零、独立演化
+        m2 = db.add_entry(Entry(name="源条目", category_id=lc, intro="I1",
+                                prompt_cn="CP", is_favorite=1))
+        m2_new = db.copy_entry_to(m2, lb)
+        c2 = db.get_entry(m2_new)
+        assert m2_new != m2 and c2["category_id"] == lb
+        assert c2["name"] == "源条目" and c2["prompt_cn"] == "CP"
+        assert c2["is_favorite"] == 0 and db.list_entry_locations(m2_new) == [lb]
+        db.update_entry(Entry(id=m2_new, category_id=lb, name="源条目2", prompt_cn="CP2"))
+        assert db.get_entry(m2)["prompt_cn"] == "CP"  # 原条目不受副本影响
+        print("[29] 条目复制到（独立副本）通过")
+
+        # 30. 分类删除保护：安全删除 / 级联删除短语守卫
+        dom_d = db.add_domain("删除域", project_id=pj_id)
+        g1 = db.add_category("GA", domain_id=dom_d)
+        h1 = db.add_category("HA", parent_id=g1)
+        e_in = db.add_entry(Entry(name="子条目", category_id=h1))
+        e_share = db.add_entry(Entry(name="共享条目", category_id=h1))
+        db.link_entry(e_share, lc)  # 另有其它位置
+        try:  # 有子分类 → 安全删除被拒
+            db.delete_category_safe(g1)
+            raise SystemExit("应拒绝删除含下级分类")
+        except ValueError:
+            pass
+        st = db.delete_category_safe(h1)
+        assert st == {"categories": 1, "entries": 2}, st
+        assert db.get_category(h1) is None
+        assert db.get_entry(e_in)["category_id"] is None           # 无其它位置 → 未分类
+        assert any(x["id"] == e_in for x in db.list_uncategorized())
+        assert set(db.list_entry_locations(e_share)) == {lc}        # 其它位置保留
+        try:  # 短语不符 → 拒绝
+            db.delete_category_cascade(g1, "错误短语")
+            raise SystemExit("应拒绝错误确认短语")
+        except ValueError:
+            pass
+        h2 = db.add_category("HB", parent_id=g1)
+        e_in2 = db.add_entry(Entry(name="子条目2", category_id=h2))
+        st2 = db.delete_category_cascade(g1, Database._CASCADE_PHRASE)
+        assert st2 == {"categories": 2, "entries": 1}, st2          # g1+h2、条目真删
+        assert db.get_category(g1) is None and db.get_category(h2) is None
+        assert db.get_entry(e_in2) is None
+        print("[30] 分类删除保护：安全删除/级联短语 通过")
 
         print(f"[统计] {db.stats()}")
         print("=== 数据库层全部自测通过 ===")

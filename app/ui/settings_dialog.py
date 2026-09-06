@@ -10,6 +10,9 @@ settings_dialog.py - 用户设置对话框
 
 用法：SettingsDialog(master, db) —— 确定后写回 meta 并调用 master.apply_settings()。
 """
+import os
+import sys
+
 import customtkinter as ctk
 
 from .. import config
@@ -104,25 +107,43 @@ class SettingsDialog(ctk.CTkToplevel):
                       command=self.destroy).pack(side="left", padx=4)
 
     def _show_about(self) -> None:
-        """关于窗口：软件名、版本、功能亮点与技术信息（2026-08-22 第008条修订）"""
+        """关于窗口：软件名、版本、功能亮点、本机运行信息与技术信息（2026-09-07 修订）"""
         win = ctk.CTkToplevel(self)
         win.title("关于 PromptSprite")
         win.resizable(False, False)
         win.transient(self)
         win.grab_set()
+        # 本机运行信息（2026-09-07 新增：运行文件 / 程序路径 / 提示词长度）
+        if config.is_frozen():
+            exe_name = os.path.basename(sys.executable)      # 打包态：EXE 全名
+            exe_dir = os.path.dirname(sys.executable)        # 打包态：EXE 所在目录
+            run_desc = f"运行文件：{exe_name}"
+            path_desc = f"程序路径：{exe_dir}"
+        else:
+            script = os.path.basename(sys.argv[0]) if sys.argv else ""
+            run_desc = f"运行文件：开发模式（{script}），未打包 EXE"
+            path_desc = f"程序路径：{config.PROJECT_ROOT}"
         info = (
             f"{config.APP_NAME} · 提示精灵\n"
-            f"版本 V{config.APP_VERSION}（2026-08-29 发布）\n"
+            f"版本 V{config.APP_VERSION}（2026-09-07 发布）\n"
             "──────────────────────────\n"
             "本地优先的 AI 提示词管理工具：\n"
             "· 五级分类书架（项目类别/根目录/分类/子分类/条目）\n"
-            "· 内置数据：5 项目类别 · 14 根目录 · 3934 条提示词\n"
+            "· 内置数据：4 项目类别 · 10 根目录 · 2555 条提示词（精简模板）\n"
+            "· 条目多位置：关联到 / 复制到（独立副本）/ 移动到（可整体转移）\n"
+            "· 条目就地新增醒目入口；任一分级分类可持有并显示本级条目\n"
+            "· 详情区多位置提示；删除分类三级保护（级联删除需输入确认短语）\n"
             "· 老版本数据自动/引导迁移（未明确分类兜底）\n"
             "· 每日增量备份（按电脑代号区分，可换机合并导入）\n"
             "· 增量备份覆盖 增/删/改/空分类 全同步\n"
             "· 一键复制 / 快速新建 / 全局热键 Ctrl+Shift+P 唤起\n"
             "· JSON / Excel / Markdown / HTML 多格式导入导出\n"
             "· 自动全量备份（保留最近 5 份），数据 100% 本机存储，无任何联网行为\n"
+            "──────────────────────────\n"
+            f"{run_desc}\n"
+            f"{path_desc}\n"
+            "提示词长度：中文提示词不设固定字符上限——数据库为 SQLite TEXT 类型，\n"
+            "             单字段可存上亿字符，超出文本框高度时自动展开/滚动查看\n"
             "──────────────────────────\n"
             "技术栈：Python 3.12 · CustomTkinter · SQLite\n"
             "数据文件：data/prompts.db（随软件目录整体迁移即可换机使用）\n"
