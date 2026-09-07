@@ -57,11 +57,35 @@ _FIELDS = [
     ("⑩ 图像获取方案", "image_plan", 3),
 ]
 
+# 2026-09-07（第5条改进）：详情区 ②~⑩ 字段配色。
+# 每个字段独立成"浅色圆角卡片块"：标签用各自主题色文字、块底淡彩、内容框白底同色细边，
+# 与① 条目名称的深色卡呼应成统一层次，字段与字段之间有颜色区分、观感更舒服。
+_FIELD_STYLE = {
+    # key: (标签文字色, 字段块底色, 输入框底色, 输入框描边色)
+    "intro":      ("#8a5a00", "#fbf6e9", "#ffffff", "#e8dcc0"),
+    "origin":     ("#9c4a1f", "#fcf2e8", "#ffffff", "#ead2ba"),
+    "features":   ("#5b46a0", "#f4f0fb", "#ffffff", "#dcd3ee"),
+    "scenes":     ("#0f7588", "#eaf5f8", "#ffffff", "#cde3ea"),
+    "works":      ("#ad4a63", "#fbf0f3", "#ffffff", "#e9cdd5"),
+    "image_desc": ("#a03d3d", "#fbeeee", "#ffffff", "#e7cdcd"),
+    "prompt_cn":  ("#1f7a50", "#edf6f0", "#ffffff", "#d0e3d8"),
+    "prompt_en":  ("#2565b0", "#ecf3fb", "#ffffff", "#ccdcea"),
+    "image_plan": ("#7d46a0", "#f6eefa", "#ffffff", "#e2d0ea"),
+}
+_FIELD_DEFAULT_STYLE = ("#1f4e79", "#f2f5f9", "#ffffff", "#d7e0ea")
+
+
+def _field_style(key: str):
+    """取某字段的配色；(标签色, 块底色, 输入框底色, 描边色)，未配置字段用统一默认"""
+    return _FIELD_STYLE.get(key, _FIELD_DEFAULT_STYLE)
+
 _COPY_ALL = 0
 _COPY_CN = 1
 _COPY_EN = 2
 
-_HOVER_SELECT_MS = 300  # 悬停选中延迟（毫秒）：导航与条目区采用"鼠标悬浮即选择"
+_HOVER_SELECT_MS = 200  # 悬停选中延迟（毫秒）：导航与条目区采用"鼠标悬浮即选择"
+# 2026-09-07（第2条改进）：300ms→200ms，逐级悬浮选择的响应更跟手；
+# 配合"列选中改用原地高亮、不再整列重建"，切换列时明显更流畅。
 
 # 2026-08-18：提示词字段可折叠。注意：CTkTextbox 的 height 单位是【像素】而非行数！
 # 实测（默认字体）行高约 20px：
@@ -329,9 +353,8 @@ class MainWindow(ctk.CTk):
         row1 = ctk.CTkFrame(self.detail_head, fg_color="transparent")
         row1.pack(fill="x", padx=6, pady=(4, 0))
         # 名称输入框已移入详情区（① 条目名称），row1 只保留命令按钮；
-        # 显示顺序（左→右）：移动到… → 关联到… → 复制到… → 收藏 → 删除
-        # （pack side=right 时先打包的位于最右侧，故按 删除→收藏→复制→关联→移动 顺序打包）
-        self.del_btn = ctk.CTkButton(row1, text="🗑 删除", width=80, fg_color="#D9534F")
+        # 显示顺序（左→右）：移动到… → 关联到… → 复制到… → 收藏
+        # （pack side=right 时先打包的位于最右侧；"🗑 删除"2026-09-07 已移到底部常驻栏）
         self.fav_btn = ctk.CTkButton(row1, text="☆ 收藏", width=92)
         self.copyto_btn = ctk.CTkButton(row1, text="⧉ 复制到…", width=92,
                                         command=lambda: None)
@@ -339,7 +362,6 @@ class MainWindow(ctk.CTk):
                                       command=lambda: None)
         self.move_btn = ctk.CTkButton(row1, text="➜ 移动到…", width=92,
                                       command=lambda: None)
-        self.del_btn.pack(side="right", padx=2)
         self.fav_btn.pack(side="right", padx=2)
         self.copyto_btn.pack(side="right", padx=2)
         self.link_btn.pack(side="right", padx=2)
@@ -365,6 +387,25 @@ class MainWindow(ctk.CTk):
         self.detail_scroll.configure(corner_radius=12, border_width=1,
                                      border_color="#c9d3df", fg_color="#ffffff")
         self.detail_scroll.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
+
+        # 2026-09-07（第3条改进）："🗑 删除"移到详情区最下方"底部常驻栏"，
+        # 不再占用顶部操作行；无当前条目/锁定态/新增态时自动禁用（见 _apply_lock_state）。
+        # 右侧依次为 删除历史/回收站（第2条改进）、新增历史（第3条改进）。
+        self.detail_foot = ctk.CTkFrame(self.detail_root, fg_color="#e9eef5")
+        self.detail_foot.grid(row=2, column=0, sticky="ew", padx=4, pady=(0, 4))
+        self.del_btn = ctk.CTkButton(self.detail_foot, text="🗑 删除当前条目",
+                                     width=132, height=32, fg_color="#D9534F")
+        self.del_btn.pack(side="left", padx=(8, 4), pady=4)
+        self.recycle_btn = ctk.CTkButton(
+            self.detail_foot, text="♻ 删除历史 / 回收站", width=180, height=32,
+            fg_color="#6b7280", hover_color="#575e68",
+            command=self._open_recycle)
+        self.recycle_btn.pack(side="left", padx=4, pady=4)
+        self.recent_btn = ctk.CTkButton(
+            self.detail_foot, text="🕒 新增历史", width=120, height=32,
+            fg_color="#1f6f8f", hover_color="#185a73",
+            command=self._open_recent_adds)
+        self.recent_btn.pack(side="left", padx=4, pady=4)
 
     def _build_statusbar(self) -> None:
         self.status_label = ctk.CTkLabel(self, text="", anchor="w", height=24)
@@ -480,6 +521,24 @@ class MainWindow(ctk.CTk):
         for child in frame.winfo_children():
             child.destroy()
 
+    @staticmethod
+    def _scroll_top(frame) -> None:
+        """把 CTkScrollableFrame 的垂直滚动复位到顶部（2026-09-07 第4条改进）"""
+        try:
+            canvas = getattr(frame, "_parent_canvas", None)
+            if canvas is not None and canvas.winfo_exists():
+                canvas.yview_moveto(0)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _nav_hint(frame, text: str) -> None:
+        """在某导航/条目列内放一条居中提示（用于尚无可用内容的空/初始视图）"""
+        ctk.CTkLabel(frame, text=text, text_color="#9aa4b1",
+                     font=("Microsoft YaHei", 11), justify="center",
+                     anchor="center", wraplength=150,
+                     ).pack(fill="x", padx=10, pady=(14, 2))
+
     # ------------------------------------------------------------------ #
     # 悬停选中（主界面导航/条目采用"鼠标悬浮即选择"，与快捷新建一致）
     # ------------------------------------------------------------------ #
@@ -499,36 +558,27 @@ class MainWindow(ctk.CTk):
     # 根目录 / 分类导航
     # ------------------------------------------------------------------ #
     def refresh_domains(self, silent: bool = False) -> None:
-        """（重）渲染四列导航并复位。
+        """（重）渲染导航列并复位。
 
         silent=True（2026-08-18，P1-2 修复）：跳过"未保存修改"检查、保留详情区当前状态，
         供快捷新建保存后调用，避免弹出未保存确认框打断连续录入。
+
+        2026-09-07（第1条改进）：打开软件后默认【不自动选中任何层级】——仅顶级
+        "项目类别"列展示选项，其余列给出提示，由用户逐级选择后再逐列展开，
+        不再出现"尚未选择就整列灌满全部分类"的旧行为。
         """
         if not silent and not self._confirm_unsaved():
             return
-        self._ensure_default_project()
+        # 未选择任何层级时（首启/结构刷新），各列刷新函数会自动：只给提示 + “新增”按钮灰显；
+        # 用户逐级选择后按钮随可用条件自动点亮、对应列填充内容。
+        self._nav_initialized = True
         self._refresh_projects()
         self._refresh_l0()
         self._refresh_l1()
-        self._clear_frame(self.l2_frame)
-        self._clear_nav_btns("l2")
+        self._refresh_l2()
         self._render_entries([], "条目")
         if not silent:
             self._show_detail(None)
-
-    def _ensure_default_project(self) -> None:
-        """首次导航默认选择：存在未分配根目录则停留"未分配"视图，否则选中第一个项目类别"""
-        if self._nav_initialized:
-            return
-        self._nav_initialized = True
-        if self.db.list_unassigned_domains():
-            self._cur_project_id = None
-            self._view = ("project", None)
-        else:
-            projects = self.db.list_projects()
-            if projects:
-                self._cur_project_id = projects[0]["id"]
-                self._view = ("project", self._cur_project_id)
 
     # ---- 导航按钮引用（选中高亮原地更新，不销毁重建，杜绝悬停闪烁） ----
     def _clear_nav_btns(self, col: str) -> None:
@@ -623,20 +673,28 @@ class MainWindow(ctk.CTk):
             btn.bind("<Leave>", lambda _e: (self._cancel_select(),
                                             self._status_default()))
         self._apply_nav_highlight()
+        if not self.db.list_projects() and not self.db.list_unassigned_domains():
+            self._nav_hint(self.project_frame, "（暂无项目类别，请点上方新增）")
+        self._scroll_top(self.project_frame)
 
     def _select_project(self, project_id: Optional[int]) -> None:
-        """选择项目类别（None=未分配视图）：重建根目录/分类/条目列"""
-        if self._cur_project_id == project_id and self._cur_domain_id is None:
+        """选择项目类别（None=未分配视图）：列出其根目录列，再逐级展开。
+
+        2026-09-07（第1/2条改进）：不整列重建项目类别列——内容未变时仅原地更新高亮，
+        悬浮切换更流畅；未选择根目录前，一级分类列只给提示、不再灌入全库分类。
+        """
+        if (self._view == ("project", project_id)
+                and self._cur_project_id == project_id
+                and self._cur_domain_id is None):
             return
         self._cur_project_id = project_id
         self._cur_domain_id = None
         self._cur_cat_id = None
         self._view = ("project", project_id)
-        self._refresh_projects()   # 原地高亮
+        self._apply_nav_highlight()   # 2026-09-07：原地高亮，避免整列重建拖慢悬浮
         self._refresh_l0()
         self._refresh_l1()
-        self._clear_frame(self.l2_frame)
-        self._clear_nav_btns("l2")
+        self._refresh_l2()            # 未选一级分类 → 显示"请先选一级分类"提示
         self._render_entries([], "条目")
 
     def _toggle_project_column(self) -> None:
@@ -667,6 +725,7 @@ class MainWindow(ctk.CTk):
         name = simpledialog.askstring("新增项目类别", "请输入项目类别名称：", parent=self)
         if name and name.strip():
             pid = self.db.add_project(name.strip())
+            self._refresh_projects()  # 2026-09-07：先重建列使新按钮出现（_select_project 现仅原地高亮）
             self._select_project(pid)
             self.toast("✅ 已新增项目类别")
 
@@ -735,14 +794,25 @@ class MainWindow(ctk.CTk):
         self.toast("✅ 已移动")
 
     def _refresh_l0(self) -> None:
-        """渲染根目录列（当前项目类别下；"未分配"视图显示无归属根目录）"""
+        """渲染根目录列（当前项目类别下；"未分配"视图显示无归属根目录）。
+
+        2026-09-07（第1条改进）：尚未选择任何项目类别时只给提示、不预填内容。
+        """
         self._clear_frame(self.l0_frame)
         self._clear_nav_btns("l0")
         ctk.CTkButton(self.l0_frame, text="➕ 新增根目录", height=30, **_ADD_BTN,
-                      state="disabled" if self._lock_on else "normal",  # 2026-08-21（第005条）：锁定时禁用新增
+                      state=("disabled" if (self._lock_on
+                                            or (self._view is None and self._cur_project_id is None))
+                             else "normal"),
+                      # 2026-08-21（第005条）：锁定时禁用新增；2026-09-07：未选任何项目时灰显但保留可见
                       command=self._add_domain).pack(fill="x", padx=6, pady=3)
-        domains = (self.db.list_unassigned_domains() if self._cur_project_id is None
-                   else self.db.list_domains(project_id=self._cur_project_id))
+        if self._view is None and self._cur_project_id is None:
+            domains = []                      # 初始态：未选项目类别 → 列留提示
+            empty_hint = "先选择上方「项目类别」，\n此处将列出其根目录"
+        else:
+            domains = (self.db.list_unassigned_domains() if self._cur_project_id is None
+                       else self.db.list_domains(project_id=self._cur_project_id))
+            empty_hint = "（该视图暂无根目录）"
         for d in domains:
             btn = ctk.CTkButton(self.l0_frame, text=d["name"], anchor="w", height=32,
                                 command=lambda did=d["id"]: self._select_domain(did))
@@ -759,7 +829,10 @@ class MainWindow(ctk.CTk):
             btn.bind("<Leave>", lambda _e: (self._cancel_select(),
                                             self._status_default()))  # 2026-08-18：离开恢复默认统计
             self._attach_nav_tooltip(btn, d["name"], 6)  # 2026-08-29：长名称悬停提示
+        if not domains:
+            self._nav_hint(self.l0_frame, empty_hint)
         self._apply_nav_highlight()
+        self._scroll_top(self.l0_frame)
 
     def _select_domain(self, domain_id: int) -> None:
         # 已选中同一根目录且未深入子级时直接返回
@@ -769,13 +842,10 @@ class MainWindow(ctk.CTk):
         self._cur_domain_id = domain_id
         self._cur_cat_id = None
         self._view = ("domain", domain_id)
+        self._apply_nav_highlight()  # 2026-09-07：根目录列原地高亮（内容未变，不再整列重建）
         if domain_changed:
-            self._refresh_l0()   # 领域切换：重建（含高亮）
             self._refresh_l1()   # 一级内容随领域变化
-        else:
-            self._apply_nav_highlight()  # 返回根视图：原地更新高亮
-        self._clear_frame(self.l2_frame)
-        self._clear_nav_btns("l2")
+        self._refresh_l2()       # 未选一级分类 → 显示"请先选一级分类"提示
         self._render_entries([], "条目")
 
     # ---- 选中链路辅助（用于三列高亮） ----
@@ -814,12 +884,24 @@ class MainWindow(ctk.CTk):
             self._refresh_l1()
 
     def _refresh_l1(self) -> None:
+        """渲染一级分类列。
+
+        2026-09-07（第1条改进）：未选择根目录时只显示提示，
+        不再把全库一级分类无差别灌入（旧行为会一次性铺满整列）。
+        """
         self._clear_frame(self.l1_frame)
         self._clear_nav_btns("l1")
         ctk.CTkButton(self.l1_frame, text="➕ 新增一级分类", height=28, **_ADD_BTN,
-                      state="disabled" if self._lock_on else "normal",  # 2026-08-21（第005条）：锁定时禁用新增
+                      state="disabled" if (self._lock_on or self._cur_domain_id is None) else "normal",
+                      # 2026-08-21（第005条）：锁定时禁用新增；2026-09-07：未选根目录时灰显但保留可见
                       command=self._add_l1).pack(fill="x", padx=6, pady=2)
-        for c in self.db.list_categories(domain_id=self._cur_domain_id, parent_id=None):
+        if self._cur_domain_id is None:
+            self._nav_hint(self.l1_frame, "先在上方选择「根目录」，\n此处将列出一级分类")
+            self._apply_nav_highlight()
+            self._scroll_top(self.l1_frame)
+            return
+        cats = self.db.list_categories(domain_id=self._cur_domain_id, parent_id=None)
+        for c in cats:
             btn = ctk.CTkButton(self.l1_frame, text=c["name"], anchor="w", height=30,
                                 command=lambda cid=c["id"]: self._select_category(cid))
             btn.pack(fill="x", padx=6, pady=2)
@@ -835,7 +917,10 @@ class MainWindow(ctk.CTk):
             btn.bind("<Leave>", lambda _e: (self._cancel_select(),
                                             self._status_default()))  # 2026-08-18：离开恢复默认统计
             self._attach_nav_tooltip(btn, c["name"], 10)  # 2026-08-29：长名称悬停提示
+        if not cats:
+            self._nav_hint(self.l1_frame, "（该根目录暂无一级分类）")
         self._apply_nav_highlight()
+        self._scroll_top(self.l1_frame)
 
     def _add_l2(self) -> None:
         """二级分类新增按钮：在当前分类下新建子分类"""
@@ -854,10 +939,12 @@ class MainWindow(ctk.CTk):
         self._clear_nav_btns("l2")
         parent_id = self._l2_parent_id()
         ctk.CTkButton(self.l2_frame, text="➕ 新增二级分类", height=28, **_ADD_BTN,
-                      state="disabled" if self._lock_on else "normal",  # 2026-08-21（第005条）：锁定时禁用新增
+                      state="disabled" if (self._lock_on or self._cur_cat_id is None) else "normal",
+                      # 2026-08-21（第005条）：锁定时禁用新增；2026-09-07：未选分类时灰显但保留可见
                       command=self._add_l2).pack(fill="x", padx=6, pady=2)
         if parent_id is not None:
-            for c in self.db.list_categories(parent_id=parent_id):
+            subs = self.db.list_categories(parent_id=parent_id)
+            for c in subs:
                 btn = ctk.CTkButton(self.l2_frame, text=c["name"], anchor="w", height=30,
                                     command=lambda cid=c["id"]: self._select_category(cid))
                 btn.pack(fill="x", padx=6, pady=2)
@@ -873,7 +960,12 @@ class MainWindow(ctk.CTk):
                 btn.bind("<Leave>", lambda _e: (self._cancel_select(),
                                                 self._status_default()))  # 2026-08-18：离开恢复默认统计
                 self._attach_nav_tooltip(btn, c["name"], 10)  # 2026-08-29：长名称悬停提示
+            if not subs:
+                self._nav_hint(self.l2_frame, "（该分类暂无二级分类）")
+        else:
+            self._nav_hint(self.l2_frame, "先选择一级分类，\n此处将列出二级分类")
         self._apply_nav_highlight()
+        self._scroll_top(self.l2_frame)
 
     def _select_category(self, cat_id: int) -> None:
         """点击/悬停分类：高亮原地更新；一级展开时重建二级列。
@@ -1018,6 +1110,7 @@ class MainWindow(ctk.CTk):
         if not entries:
             ctk.CTkLabel(self.entry_frame, text="（暂无条目）",
                          text_color="gray").pack(pady=30)
+            self._scroll_top(self.entry_frame)  # 2026-09-07（第4条改进）
             return
         if self._view_mode == "card":
             for e in entries:
@@ -1025,6 +1118,7 @@ class MainWindow(ctk.CTk):
         else:
             for e in entries:
                 self._add_row(e)
+        self._scroll_top(self.entry_frame)  # 2026-09-07（第4条改进）：切换分类后条目列回到顶部
 
     def _add_card(self, e: dict) -> None:
         card = ctk.CTkFrame(self.entry_frame, corner_radius=8)
@@ -1152,24 +1246,26 @@ class MainWindow(ctk.CTk):
         self._build_detail_location_hint(e["id"])
         self._apply_lock_state()
 
-        # 9 字段（可编辑文本框 + 悬停完整内容提示；提示词字段可折叠；③-⑦ 按根目录可隐藏）
+        # 9 字段（彩色卡片块 + 可编辑文本框 + 悬停完整内容提示；提示词字段可折叠；③-⑦ 按根目录可隐藏）
         for label, key, height in _FIELDS:
             if key in self._detail_hidden:  # 2026-08-18：当前根目录下隐藏 ③-⑦
                 continue
             if key in _COLLAPSIBLE_KEYS:  # ⑧/⑨ 提示词：有内容默认 36 行、可展开 72 行，无内容 1 行
                 self._build_collapsible_field(e, label, key)
                 continue
-            ctk.CTkFrame(self.detail_scroll, height=1, fg_color="#e6ebf1"
-                         ).pack(fill="x", padx=12, pady=(10, 0))  # 2026-09-07 美化：字段间浅分隔线
-            lbl = ctk.CTkLabel(self.detail_scroll, text=label,
+            # 2026-09-07（第5条改进）：每字段成"淡彩圆角卡片块"，标签主题色文字 + 白底同色细边文本框
+            block, label_c, box_bg, box_border = self._begin_field_block(key)
+            lbl = ctk.CTkLabel(block, text=label, text_color=label_c,
                                font=("Microsoft YaHei", 12, "bold"), anchor="w")
-            lbl.pack(fill="x", padx=8, pady=(6, 0))
+            lbl.pack(fill="x", padx=12, pady=(8, 2))
             # 2026-08-18（第015条）：⑩图像获取方案 若为链接 → 文本框右侧加"打开"按钮，既能复制网址（左）、又能打开网址（右）
             # 按钮实时读取文本框内容（_open_image_plan），输入链接保存后即可直接打开
             if key == "image_plan":
-                row = ctk.CTkFrame(self.detail_scroll, fg_color="transparent")
-                row.pack(fill="x", padx=8, pady=(0, 2))
-                box = ctk.CTkTextbox(row, height=height)
+                row = ctk.CTkFrame(block, fg_color="transparent")
+                row.pack(fill="x", padx=6, pady=(0, 6))
+                box = ctk.CTkTextbox(row, height=height, fg_color=box_bg,
+                                     border_width=1, border_color=box_border,
+                                     corner_radius=6)
                 box.pack(side="left", fill="x", expand=True)
                 url = (e[key] or "").strip()
                 if url.startswith(("http://", "https://")):
@@ -1178,8 +1274,10 @@ class MainWindow(ctk.CTk):
                         command=lambda b=box: self._open_image_plan(b))
                     open_btn.pack(side="right", padx=(6, 0))
             else:
-                box = ctk.CTkTextbox(self.detail_scroll, height=height)
-                box.pack(fill="x", padx=8, pady=(0, 2))
+                box = ctk.CTkTextbox(block, height=height, fg_color=box_bg,
+                                     border_width=1, border_color=box_border,
+                                     corner_radius=6)
+                box.pack(fill="x", padx=6, pady=(0, 6))
             box.insert("1.0", e[key] or "")
             box.bind("<KeyRelease>", self._mark_dirty)
             self._detail_boxes[key] = box
@@ -1188,6 +1286,7 @@ class MainWindow(ctk.CTk):
             _FieldTooltip(box, full)
             if key == "image_desc":  # ⑦ 字段下方紧跟图片预览区
                 self._build_image_area()
+        self._scroll_top(self.detail_scroll)  # 2026-09-07（第4条改进）：打开新条目详情回到顶部
 
     def _build_collapsible_field(self, e, label: str, key: str) -> None:
         """可折叠字段：标签行 + 展开/收起按钮 + 文本框（height 单位为像素）。
@@ -1199,12 +1298,11 @@ class MainWindow(ctk.CTk):
         has_content = bool((e[key] or "").strip())
         base_h = _COLLAPSED_H if has_content else _EMPTY_H
 
-        # 2026-09-07 美化：字段上方 1px 浅分隔线 + 内容/展开状态小标签
-        ctk.CTkFrame(self.detail_scroll, height=1, fg_color="#e6ebf1"
-                     ).pack(fill="x", padx=12, pady=(10, 0))
-        head = ctk.CTkFrame(self.detail_scroll, fg_color="transparent")
-        head.pack(fill="x", padx=8, pady=(6, 0))
-        lbl = ctk.CTkLabel(head, text=label,
+        # 2026-09-07（第5条改进）：可折叠字段同样用"淡彩卡片块"——标签主题色 + 内容状态小标签
+        block, label_c, box_bg, box_border = self._begin_field_block(key)
+        head = ctk.CTkFrame(block, fg_color="transparent")
+        head.pack(fill="x", padx=10, pady=(8, 0))
+        lbl = ctk.CTkLabel(head, text=label, text_color=label_c,
                            font=("Microsoft YaHei", 12, "bold"), anchor="w")
         lbl.pack(side="left")
         status = ctk.CTkLabel(
@@ -1218,8 +1316,9 @@ class MainWindow(ctk.CTk):
             toggle = ctk.CTkButton(head, text="展开", width=52, height=22, **_ADD_BTN)
             toggle.pack(side="right")
 
-        box = ctk.CTkTextbox(self.detail_scroll, height=base_h)
-        box.pack(fill="x", padx=8, pady=(0, 2))
+        box = ctk.CTkTextbox(block, height=base_h, fg_color=box_bg,
+                             border_width=1, border_color=box_border, corner_radius=6)
+        box.pack(fill="x", padx=6, pady=(0, 8))
         box.insert("1.0", e[key] or "")
         box.bind("<KeyRelease>", self._mark_dirty)
         self._detail_boxes[key] = box
@@ -1449,17 +1548,59 @@ class MainWindow(ctk.CTk):
             cid = c["parent_id"]
         return " › ".join(reversed(parts))
 
+    def _full_location_path(self, cat_id: int) -> str:
+        """位置"面包屑"完整路径：项目类别 › 根目录 › 一级分类 › …（2026-09-07 第2条改进）。
+
+        任一分级分类都可能挂在某根目录（L0）下；根目录再归属某项目类别（最高层级），
+        据此拼出从最高层到自身的完整链；未关联到任何根目录时退化为分类链本身。
+        """
+        root = self.db.category_root(cat_id)
+        segs = []
+        if root:
+            doms = self.db.linked_domains(root)
+            if doms:
+                d = doms[0]
+                if d.get("project_id"):
+                    p = self.db.get_project(d["project_id"])
+                    if p:
+                        segs.append(p["name"])
+                segs.append(d["name"])
+        parts = []
+        cid = cat_id
+        seen = set()
+        while cid is not None and cid not in seen:
+            c = self.db.get_category(cid)
+            if not c:
+                break
+            parts.append(c["name"])
+            seen.add(cid)
+            cid = c["parent_id"]
+        segs.extend(reversed(parts))
+        return " › ".join(segs) if segs else "未分类"
+
+    def _begin_field_block(self, key: str, pady_top: int = 10) -> tuple:
+        """为 ②~⑩ 某一字段新建"淡彩圆角卡片块"（2026-09-07 第5条改进）。
+
+        返回 (block, 标签文字色, 输入框底色, 输入框描边色)，调用方在其内部放标签与输入框，
+        各字段因此拥有各自的浅彩底色与主题色标签，与 ① 名称深蓝卡形成统一层次。
+        """
+        label_c, block_bg, box_bg, box_border = _field_style(key)
+        block = ctk.CTkFrame(self.detail_scroll, fg_color=block_bg, corner_radius=10,
+                             border_width=1, border_color=box_border)
+        block.pack(fill="x", padx=10, pady=(pady_top, 2))
+        return block, label_c, box_bg, box_border
+
     def _build_name_field(self, initial: str = "") -> None:
         """详情/新增表单的"① 条目名称（风格名称）"输入字段（2026-09-07）。
 
-        以淡蓝卡片 + 细边框突出"主字段"，与下方 ②~⑩ 普通字段形成层次。
+        以淡蓝卡片 + 细边框突出"主字段"，与下方 ②~⑩ 淡彩字段块形成统一层次。
         """
-        card = ctk.CTkFrame(self.detail_scroll, fg_color="#eef4fb",
-                            corner_radius=10, border_width=1, border_color="#d3dfee")
+        card = ctk.CTkFrame(self.detail_scroll, fg_color="#e2edfa",
+                            corner_radius=10, border_width=1, border_color="#a9c6e4")
         card.pack(fill="x", padx=10, pady=(10, 2))
         ctk.CTkLabel(card, text="① 条目名称（风格名称）",
                      font=("Microsoft YaHei", 13, "bold"), anchor="w",
-                     text_color="#1f2937").pack(fill="x", padx=12, pady=(8, 2))
+                     text_color="#1d4e89").pack(fill="x", padx=12, pady=(8, 2))
         self._name_entry = ctk.CTkEntry(card, height=44,
                                         font=("Microsoft YaHei", 15, "bold"))
         self._name_entry.pack(fill="x", padx=12, pady=(0, 8))
@@ -1469,41 +1610,45 @@ class MainWindow(ctk.CTk):
     def _build_detail_location_hint(self, entry_id: int) -> None:
         """详情区顶部"所在位置"提示行（2026-09-07 阶段3）。
 
-        列出条目全部位置：主位置标"主"，额外关联位置各带"×"解除按钮。
+        列出条目全部位置（面包屑式完整链）：主位置标"主"，额外关联位置各带"×"解除按钮。
+        2026-09-07（第2条改进）：面包屑带出「项目类别 › 根目录 › …」两级，
+        并将整个面包屑栏背景改为更淡的浅蓝灰底、轻色小标签。
         """
         locs = self.db.list_entry_locations(entry_id)
         if not locs:
             return
         main_id = (self.db.get_entry(entry_id) or {}).get("category_id")
-        head = ctk.CTkFrame(self.detail_scroll, fg_color="transparent")
-        head.pack(fill="x", padx=8, pady=(8, 0))
-        ctk.CTkLabel(head, text="📌 位置：", font=("Microsoft YaHei", 12, "bold"),
-                     text_color="#25639c").pack(side="left")
+        head = ctk.CTkFrame(self.detail_scroll, fg_color="#eaf1f9",
+                            corner_radius=10, border_width=1,
+                            border_color="#d6e2ef")
+        head.pack(fill="x", padx=10, pady=(8, 0))
+        ctk.CTkLabel(head, text="🧭 位置", font=("Microsoft YaHei", 12, "bold"),
+                     text_color="#5a6f88").pack(side="left", padx=(12, 4), pady=6)
         for cid in locs:
-            name = self._cat_label(cid)
+            bread = self._full_location_path(cid)
             is_main = cid == main_id
-            # 主位置=主题绿（白字）；关联位置=灰蓝（蓝字），视觉快速区分（2026-09-07 美化）
+            # 主位置=浅绿、关联=浅灰蓝（浅色背景+深色字），整体观感更轻
             if is_main:
-                chip = ctk.CTkFrame(head, fg_color="#2E8B57", corner_radius=8)
+                chip = ctk.CTkFrame(head, fg_color="#e3f2ea", corner_radius=8)
                 tag = "主"
-                txt_color = "white"
+                txt_color = "#1f7a50"
             else:
-                chip = ctk.CTkFrame(head, fg_color="#e3ebf5", corner_radius=8)
+                chip = ctk.CTkFrame(head, fg_color="#e8eef6", corner_radius=8)
                 tag = "关联"
                 txt_color = "#25639c"
-            chip.pack(side="left", padx=(0, 6), pady=2)
-            ctk.CTkLabel(chip, text=f"{tag}·{name}",
+            chip.pack(side="left", padx=(0, 6), pady=6)
+            ctk.CTkLabel(chip, text=f"{tag} · {bread}",
                          font=("Microsoft YaHei", 11),
                          text_color=txt_color).pack(side="left", padx=6, pady=2)
             if not is_main:  # 关联位置提供"解除"按钮（主位置用右键菜单移动/解除）
                 ctk.CTkButton(
-                    chip, text="×", width=22, height=20, fg_color="#8a94a6",
+                    chip, text="×", width=22, height=20, fg_color="#9aa9ba",
                     command=lambda c=cid: self._remove_detail_location(entry_id, c)
                 ).pack(side="right", padx=(0, 3), pady=2)
         # 提示：多位置条目编辑一处全同步
         if len(locs) > 1:
             ctk.CTkLabel(head, text="（同一条目编辑后各位置同步）",
-                         text_color="gray", font=("Microsoft YaHei", 10)
+                         text_color="#8aa0b5", font=("Microsoft YaHei", 10)
                          ).pack(side="left", padx=(2, 0))
 
     def _remove_detail_location(self, entry_id: int, cat_id: int) -> None:
@@ -1582,6 +1727,7 @@ class MainWindow(ctk.CTk):
         self._add_field_block("⑨ 英文版提示词", "prompt_en", prompt=True)
         # ⑩ 图像获取方案（右侧"打开"按钮，与详情一致）
         self._add_field_block("⑩ 图像获取方案", "image_plan")
+        self._scroll_top(self.detail_scroll)  # 2026-09-07（第4条改进）：打开新增表单回到顶部
 
         if not self._lock_on:
             self._name_entry.focus_set()
@@ -1591,25 +1737,27 @@ class MainWindow(ctk.CTk):
 
         非折叠框沿用详情编辑的像素高度（_FIELDS）；⑧/⑨ 提示词固定 120px≈6 行，
         便于"内容少时直接填中文提示词"；⑩ 追加"打开"按钮读取网址。
+        （2026-09-07 第5条改进：与详情编辑一致的淡彩卡片块样式）
         """
         heights = {k: h for _l, k, h in _FIELDS}
-        ctk.CTkFrame(self.detail_scroll, height=1, fg_color="#e6ebf1"
-                     ).pack(fill="x", padx=12, pady=(10, 0))  # 2026-09-07 美化：字段间浅分隔线
-        ctk.CTkLabel(self.detail_scroll, text=label,
+        block, label_c, box_bg, box_border = self._begin_field_block(key)
+        ctk.CTkLabel(block, text=label, text_color=label_c,
                      font=("Microsoft YaHei", 12, "bold"), anchor="w"
-                     ).pack(fill="x", padx=8, pady=(6, 0))
+                     ).pack(fill="x", padx=12, pady=(8, 2))
         if key == "image_plan":
-            row = ctk.CTkFrame(self.detail_scroll, fg_color="transparent")
-            row.pack(fill="x", padx=8, pady=(0, 2))
-            box = ctk.CTkTextbox(row, height=heights.get(key, 3))
+            row = ctk.CTkFrame(block, fg_color="transparent")
+            row.pack(fill="x", padx=6, pady=(0, 6))
+            box = ctk.CTkTextbox(row, height=heights.get(key, 3), fg_color=box_bg,
+                                 border_width=1, border_color=box_border, corner_radius=6)
             box.pack(side="left", fill="x", expand=True)
             open_btn = ctk.CTkButton(row, text="打开", width=52, height=28,
                                      command=lambda b=box: self._open_image_plan(b))
             open_btn.pack(side="right", padx=(6, 0))
         else:
             h = 120 if prompt else heights.get(key, 3)
-            box = ctk.CTkTextbox(self.detail_scroll, height=h)
-            box.pack(fill="x", padx=8, pady=(0, 2))
+            box = ctk.CTkTextbox(block, height=h, fg_color=box_bg,
+                                 border_width=1, border_color=box_border, corner_radius=6)
+            box.pack(fill="x", padx=6, pady=(0, 6))
         box.bind("<KeyRelease>", self._mark_dirty)
         self._detail_boxes[key] = box
 
@@ -1634,25 +1782,30 @@ class MainWindow(ctk.CTk):
         for label, key in (("③ 溯源", "origin"), ("④ 核心特征", "features"),
                            ("⑤ 应用场景", "scenes"), ("⑥ 代表作", "works"),
                            ("⑦ 代表高清配图", "image_desc")):
-            lbl = ctk.CTkLabel(container, text=label,
-                               font=("Microsoft YaHei", 12, "bold"), anchor="w")
-            box = ctk.CTkTextbox(container, height=heights.get(key, 3))
+            # 2026-09-07（第5条改进）：组内每字段同样用淡彩卡片块
+            label_c, block_bg, box_bg, box_border = _field_style(key)
+            blk = ctk.CTkFrame(container, fg_color=block_bg, corner_radius=10,
+                               border_width=1, border_color=box_border)
+            ctk.CTkLabel(blk, text=label, text_color=label_c,
+                         font=("Microsoft YaHei", 12, "bold"), anchor="w"
+                         ).pack(fill="x", padx=12, pady=(8, 2))
+            box = ctk.CTkTextbox(blk, height=heights.get(key, 3), fg_color=box_bg,
+                                 border_width=1, border_color=box_border, corner_radius=6)
+            box.pack(fill="x", padx=6, pady=(0, 6))
             box.bind("<KeyRelease>", self._mark_dirty)
             self._detail_boxes[key] = box
-            self._add_group_pairs.append((lbl, box))
+            self._add_group_pairs.append((blk, box))
 
     def _toggle_add_group(self) -> None:
-        """展开/收起 ③-⑦ 补充信息组（内容保留，仅切换显隐）"""
+        """展开/收起 ③-⑦ 补充信息组（内容保留，仅切换整块显隐）"""
         if not self._add_group_open:
-            for lbl, box in self._add_group_pairs:
-                lbl.pack(fill="x", padx=8, pady=(6, 0))
-                box.pack(fill="x", padx=8, pady=(0, 2))
+            for blk, _box in self._add_group_pairs:
+                blk.pack(fill="x", padx=10, pady=(6, 2))
             self._add_group_toggle.configure(text="收起")
             self._add_group_open = True
         else:
-            for lbl, box in reversed(self._add_group_pairs):
-                box.pack_forget()
-                lbl.pack_forget()
+            for blk, _box in reversed(self._add_group_pairs):
+                blk.pack_forget()
             self._add_group_toggle.configure(text="展开")
             self._add_group_open = False
 
@@ -1934,16 +2087,18 @@ class MainWindow(ctk.CTk):
                      "删除后将在全部位置消失。")
         else:
             scope = ""
+        # 2026-09-07（第2条改进）：删除＝移入回收站，可随时从"删除历史/回收站"恢复
         if not messagebox.askyesno("删除确认",
                                    f"⚠️ 确定要删除【{e['name']}】吗？{scope}"):
             return
-        if not messagebox.askyesno("再次确认", "🚨 删除后不可恢复！请再次点击确定。"):
+        if not messagebox.askyesno("再次确认",
+                                   "确定移入回收站？\n（可从详情区下方“♻ 删除历史/回收站”恢复）"):
             return
-        self.db.delete_entry(entry_id)
+        self.db.trash_entry(entry_id, reason="手动删除")
         self._restore_view()
         if self._detail_entry_id == entry_id:
             self._show_detail(None)
-        self.toast("已删除")
+        self.toast("已删除（可到回收站恢复）")
 
     # ------------------------------------------------------------------ #
     # 锁定开关
@@ -1959,7 +2114,7 @@ class MainWindow(ctk.CTk):
                 text="🔒 锁定",
                 fg_color=self._lock_btn_default_fg,
                 hover_color=self._lock_btn_default_hover)
-        self._apply_lock_state()
+        self._apply_lock_state(rebuild_nav=True)  # 2026-09-07：仅锁定切换时重建导航列
         self.toast("已开启全局锁定，删除功能已禁用" if self._lock_on else "已解除锁定")
 
     def _set_child_states(self, widget, state: str) -> None:
@@ -1971,8 +2126,13 @@ class MainWindow(ctk.CTk):
                 pass
             self._set_child_states(child, state)
 
-    def _apply_lock_state(self) -> None:
-        """锁定：只能查询和复制，禁止移动/删除/新增/重命名/导入/编辑保存等（2026-08-21 第005条扩展）"""
+    def _apply_lock_state(self, rebuild_nav: bool = False) -> None:
+        """锁定：只能查询和复制，禁止移动/删除/新增/重命名/导入/编辑保存等（2026-08-21 第005条扩展）。
+
+        rebuild_nav（2026-09-07 第2条改进）：仅在锁定开关真正切换时才重建 4 个导航列；
+        平时展示/切换条目也会调用本方法刷新详情控件状态，若每次都整列重建，
+        会造成"悬浮逐级选择反应迟钝"与导航滚动位置被顶回顶部。
+        """
         locked = self._lock_on
         state = "disabled" if locked else "normal"
         for attr in ("del_btn", "fav_btn", "move_btn", "link_btn", "copyto_btn",
@@ -2005,11 +2165,12 @@ class MainWindow(ctk.CTk):
                         self.import_menu.entryconfigure(i, state=state)
                     except tk.TclError:
                         pass  # 分隔符等不支持 state 的项跳过（2026-08-29 M5：菜单新增分隔符后修复）
-        # 重建新增按钮（p/l0/l1/l2 的"➕新增…"按锁定置灰）
-        self._refresh_projects()
-        self._refresh_l0()
-        self._refresh_l1()
-        self._refresh_l2()
+        # 2026-09-07：锁定开关真正切换时才重建 4 个导航列（避免每次显示条目的重建开销）
+        if rebuild_nav:
+            self._refresh_projects()
+            self._refresh_l0()
+            self._refresh_l1()
+            self._refresh_l2()
         # 2026-09-06：同步条目区"新增条目"按钮（随锁定/视图启用置灰）
         if self._add_entry_btn is not None and self._add_entry_btn.winfo_exists():
             self._add_entry_btn.configure(
@@ -2023,9 +2184,10 @@ class MainWindow(ctk.CTk):
                     w.configure(state="disabled")
                 except Exception:
                     pass
-        # 2026-09-07（阶段2）：无当前条目时 关联到/复制到/移动到 保持禁用
+        # 2026-09-07（阶段2/第3条）：无当前条目时 删除/关联到/复制到/移动到 保持禁用
+        # （删除按钮在详情区底部常驻栏，无条目时应为置灰而非"点了没反应"）
         if not locked and not self._adding_new and self._detail_entry_id is None:
-            for w in (self.move_btn, self.link_btn, self.copyto_btn):
+            for w in (self.del_btn, self.move_btn, self.link_btn, self.copyto_btn):
                 try:
                     w.configure(state="disabled")
                 except Exception:
@@ -2246,15 +2408,15 @@ class MainWindow(ctk.CTk):
         self._after_delete_category(cat)
 
     def _cascade_delete_category(self, cat_id: int, cat: dict) -> None:
-        """级联删除整棵（该分类 + 全部下级分类 + 相关条目真删）：
+        """级联删除整棵：分类结构永久删除；其中直挂条目先移入回收站（可恢复），
         输入确认短语 → 再次确认 → 执行。"""
         stat = self.db.count_descendants(cat_id)
         phrase = self.db._CASCADE_PHRASE
         got = simpledialog.askstring(
             "级联删除确认",
-            f"将永久删除：\n【{cat['name']}】及其全部下级分类（共 "
-            f"{stat['categories'] + 1} 个分类），直挂条目 {stat['entries']} 条"
-            "（含关联图片文件）。\n\n"
+            f"将删除：\n【{cat['name']}】及其全部下级分类（共 {stat['categories'] + 1} 个分类）。\n"
+            f"其中直挂条目 {stat['entries']} 条将移入回收站（可在“删除历史/回收站”中恢复，"
+            "图片文件保留至回收站彻底清除）。\n\n"
             f"请输入确认短语「{phrase}」以继续：",
             parent=self)
         if not got:
@@ -2264,10 +2426,11 @@ class MainWindow(ctk.CTk):
             return
         if not messagebox.askyesno(
                 "最后确认",
-                "🚨 再次确认：将永久删除以上分类、下级分类与相关条目，不可恢复。确定删除？"):
+                "🚨 再次确认：分类及其全部下级分类结构将【永久删除】；\n"
+                "相关条目移入回收站（彻底清除前可恢复）。确定删除？"):
             return
         self.db.delete_category_cascade(cat_id, phrase)
-        self.toast("✅ 已级联删除")
+        self.toast("✅ 已级联删除（条目已入回收站）")
         self._after_delete_category(cat, reset_view=True)
 
     def _after_delete_category(self, cat: dict, reset_view: bool = False) -> None:
@@ -2611,6 +2774,20 @@ class MainWindow(ctk.CTk):
         if self._detail_entry_id is not None:
             self._show_detail(self.db.get_entry(self._detail_entry_id))  # 详情策略重建
         self.toast("✅ 设置已保存")
+
+    # ------------------------------------------------------------------ #
+    # 删除历史/回收站 与 新增历史（2026-09-07 第2/3条改进）
+    # ------------------------------------------------------------------ #
+    def _open_recycle(self) -> None:
+        """打开"删除历史 / 回收站"：可恢复被删条目，或彻底删除/清空"""
+        from .history_dialog import RecycleBinDialog
+        dlg = RecycleBinDialog(self, self.db, locked=self._lock_on)
+        self.wait_window(dlg)
+
+    def _open_recent_adds(self) -> None:
+        """打开"新增历史"：查看最近新增的条目"""
+        from .history_dialog import RecentAdditionsDialog
+        RecentAdditionsDialog(self, self.db)
 
     def show_and_focus_search(self) -> None:
         """全局热键/托盘回调：恢复窗口并聚焦搜索框"""

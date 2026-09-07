@@ -113,6 +113,16 @@ CREATE INDEX IF NOT EXISTS idx_dc_category        ON domain_category(category_id
 CREATE INDEX IF NOT EXISTS idx_entries_category   ON entries(category_id);
 CREATE INDEX IF NOT EXISTS idx_entries_favorite   ON entries(is_favorite);
 CREATE INDEX IF NOT EXISTS idx_entry_links_cat    ON entry_links(category_id);
+
+-- 2026-09-07（第2条改进）：回收站/删除历史——保存被删条目的完整快照，支持恢复
+CREATE TABLE IF NOT EXISTS trash (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    payload     TEXT NOT NULL,          -- JSON：完整条目字段 + locations 位置列表 + chain 名称链 + 原 id
+    deleted_at  TEXT,
+    reason      TEXT DEFAULT ''         -- 删除来源：手动删除 / 级联删除
+);
+CREATE INDEX IF NOT EXISTS idx_trash_deleted ON trash(deleted_at);
 """
 
 # 数据库结构版本（meta 键 schema_version）；v1=旧版按领域归属分类，v2=全局分类+领域关联，v3=四级分类（项目类别）
@@ -183,6 +193,14 @@ class Database:
             " PRIMARY KEY (entry_id, category_id))")
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_entry_links_cat ON entry_links(category_id)")
+        # 2026-09-07（第2条改进）：存量库幂等补建 trash 回收站表 + 索引
+        self.conn.executescript(
+            "CREATE TABLE IF NOT EXISTS trash ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " name TEXT NOT NULL, payload TEXT NOT NULL,"
+            " deleted_at TEXT, reason TEXT DEFAULT '')")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trash_deleted ON trash(deleted_at)")
         # 回填：旧数据无时间戳 → 设为固定旧时间（不在任何"今日"范围内）；
         # 2026-08-29（复审优化）：仅当存在空值时执行，避免每次打开全表 UPDATE
         if self.conn.execute(
@@ -783,9 +801,15 @@ class Database:
         row = self.conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
         return dict(row) if row else None
 
-    def delete_entry(self, entry_id: int) -> None:
+    def delete_entry(self, entry_id: int, purge_image: bool = True) -> None:
+        """物理删除条目（硬删除）。
+
+        purge_image（2026-09-07 第2条改进）：是否同步删除关联图片文件。
+        手动删除/级联删除先经 trash_entry() 写入回收站并保留图片（恢复可用），
+        只有"回收站彻底删除/清空"时才 purge_image=True 释放图片。
+        """
         entry = self.get_entry(entry_id)
-        if entry and entry.get("image_path"):
+        if entry and entry.get("image_path") and purge_image:
             self._remove_image_file(entry["image_path"])  # 同步删除关联图片（尽力而为）
         # 2026-08-29（增量备份增强）：记录删除日志，供换机同步删除
         if entry:
@@ -796,6 +820,139 @@ class Database:
             )
         self.conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
         self.conn.commit()
+
+    # ------------------------------------------------------------------ #
+    # 回收站 / 删除历史（2026-09-07 第2条改进：可恢复删除的条目）
+    # 说明：deletion_log 只记"名字+内容键"用于换机增量同步；
+    #       trash 保存完整内容快照，用于本机"恢复删除的条目"。
+    # ------------------------------------------------------------------ #
+    def trash_entry(self, entry_id: int, reason: str = "手动删除") -> bool:
+        """把条目移入回收站：完整快照入 trash → 硬删除（保留图片文件，便于恢复）。
+
+        返回是否成功（条目不存在返回 False）。
+        """
+        e = self.get_entry(entry_id)
+        if not e:
+            return False
+        payload = dict(e)
+        payload["locations"] = self._entry_location_ids(entry_id)  # 全部位置（含主挂靠）
+        payload["chain"] = (self._category_name_chain(e["category_id"])
+                            if e.get("category_id") else [])
+        self.conn.execute(
+            "INSERT INTO trash(name, payload, deleted_at, reason) VALUES(?, ?, ?, ?)",
+            (e["name"], json.dumps(payload, ensure_ascii=False), _now(), reason),
+        )
+        self.conn.commit()
+        self.delete_entry(entry_id, purge_image=False)  # 保留图片，供恢复后继续显示
+        return True
+
+    def list_trash(self) -> List[dict]:
+        """回收站列表（最新删除在前）；payload 解析为 dict，供 UI 展示/恢复"""
+        rows = self.conn.execute(
+            "SELECT * FROM trash ORDER BY deleted_at DESC, id DESC").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["payload"] = json.loads(r["payload"])
+            except (TypeError, ValueError):
+                d["payload"] = {}
+            out.append(d)
+        return out
+
+    def count_trash(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM trash").fetchone()[0]
+
+    def restore_from_trash(self, trash_id: int) -> Optional[int]:
+        """从回收站恢复条目（重建为新 id，保留原内容/收藏/位置与创建时间）。
+
+        分类已被删除的位置自动剔除；无任何现存位置 → 恢复为「未分类」。
+        返回新条目 id；trash_id 不存在返回 None。
+        """
+        row = self.conn.execute("SELECT * FROM trash WHERE id = ?", (trash_id,)).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            payload = {}
+        now = _now()
+        # 现存位置：原主挂靠优先，其次按 id 升序
+        locs = [c for c in (payload.get("locations") or []) if self.get_category(c)]
+        main = payload.get("category_id")
+        if main not in locs:
+            main = locs[0] if locs else None
+        others = [c for c in locs if c != main]
+        try:
+            with self.conn:
+                cur = self.conn.execute(
+                    "INSERT INTO entries(category_id, name, intro, origin, features, scenes, "
+                    "works, image_desc, prompt_cn, prompt_en, image_plan, image_path, "
+                    "is_favorite, created_at, updated_at) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (main,
+                     payload.get("name", row["name"]),
+                     payload.get("intro", ""), payload.get("origin", ""),
+                     payload.get("features", ""), payload.get("scenes", ""),
+                     payload.get("works", ""), payload.get("image_desc", ""),
+                     payload.get("prompt_cn", ""), payload.get("prompt_en", ""),
+                     payload.get("image_plan", ""), payload.get("image_path", ""),
+                     1 if payload.get("is_favorite") else 0,
+                     payload.get("created_at") or now, now))
+                new_id = cur.lastrowid
+                for cid in others:
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO entry_links(entry_id, category_id, created_at) "
+                        "VALUES(?, ?, ?)", (new_id, cid, now))
+                self.conn.execute("DELETE FROM trash WHERE id = ?", (trash_id,))
+            return new_id
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def purge_trash(self, trash_id: int) -> None:
+        """彻底删除回收站中的一条（连同其关联图片文件释放）"""
+        row = self.conn.execute("SELECT * FROM trash WHERE id = ?", (trash_id,)).fetchone()
+        if not row:
+            return
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            payload = {}
+        img = payload.get("image_path") if isinstance(payload, dict) else ""
+        if img:
+            self._remove_image_file(img)
+        self.conn.execute("DELETE FROM trash WHERE id = ?", (trash_id,))
+        self.conn.commit()
+
+    def clear_trash(self) -> int:
+        """清空回收站（返回清理条数）"""
+        items = self.conn.execute("SELECT id, payload FROM trash").fetchall()
+        for it in items:
+            try:
+                payload = json.loads(it["payload"])
+                img = payload.get("image_path") if isinstance(payload, dict) else ""
+                if img:
+                    self._remove_image_file(img)
+            except (TypeError, ValueError):
+                pass
+        n = self.conn.execute("SELECT COUNT(*) FROM trash").fetchone()[0]
+        self.conn.execute("DELETE FROM trash")
+        self.conn.commit()
+        return n
+
+    def list_entries_added_since(self, since: str) -> List[dict]:
+        """按 created_at >= since 列出最近新增的条目（第3条改进：查看添加历史）"""
+        rows = self.conn.execute(
+            "SELECT * FROM entries WHERE created_at >= ? "
+            "ORDER BY created_at DESC, id DESC", (since,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def category_path(self, category_id: Optional[int]) -> str:
+        """分类路径显示文本（如"视觉风格分类 › 某分类"；无分类返回「未分类」）"""
+        if not category_id:
+            return "未分类"
+        return " › ".join(self._category_name_chain(category_id))
 
     def _remove_image_file(self, image_path: str) -> None:
         """删除条目关联的本地图片文件（相对 data/ 的路径，失败静默）。
@@ -1189,9 +1346,10 @@ class Database:
             ids + ids,
         ).fetchall()]
         try:
-            # 先真删直挂条目（含图片与删除日志，各自提交）
+            # 条目先全部移入回收站（完整快照 + 保留图片），再从主表硬删除；
+            # 分类结构与图片资源在用户"彻底删除/清空回收站"时才最终释放
             for eid in affected:
-                self.delete_entry(eid)
+                self.trash_entry(eid, reason="级联删除")
             # 记录分类删除日志
             for cid in ids:
                 c = self.get_category(cid)

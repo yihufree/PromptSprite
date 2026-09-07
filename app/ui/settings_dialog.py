@@ -147,7 +147,8 @@ class SettingsDialog(ctk.CTkToplevel):
             "──────────────────────────\n"
             "技术栈：Python 3.12 · CustomTkinter · SQLite\n"
             "数据文件：data/prompts.db（随软件目录整体迁移即可换机使用）\n"
-            "开源仓库：GitHub（MIT License，欢迎 Star / Issue）\n"
+            "开源仓库：https://github.com/yihufree/PromptSprite\n"
+            "（MIT License，欢迎 Star / Issue）\n"
             "© 2026 PromptSprite 开发组 · 仅供学习与个人使用"
         )
         ctk.CTkLabel(win, text=info, font=("Microsoft YaHei", 13),

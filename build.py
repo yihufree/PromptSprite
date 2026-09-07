@@ -14,26 +14,48 @@ build.py - PromptSprite 一键打包脚本（单 EXE）
 
 说明：
   - 优先使用 .venv 的 Python 打包（依赖已齐备）；无 .venv 时使用当前解释器。
-  - 打包产物为单文件：dist/PromptSprite.exe（内置手册、图标、完整最新数据库一并内嵌）。
+  - 打包产物为单文件（内置手册、图标、完整最新数据库一并内嵌），并自动按
+    PromptSprite_<日期YYMMDD>_V<版本号>.EXE 命名（如 PromptSprite_260907_V1.6.0.EXE，2026-09-07 第7条）。
   - 每次打包均携带开发态最新数据（3934 条等），保证 EXE 开箱即用最新内容。
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 REQUIREMENTS = os.path.join(ROOT, "requirements.txt")
 SPEC = os.path.join(ROOT, "build", "PromptSprite.spec")
 ICON_GEN = os.path.join(ROOT, "build", "generate_icon.py")
-EXE_OUT = os.path.join(ROOT, "dist", "PromptSprite.exe")
+DIST_DIR = os.path.join(ROOT, "dist")
+EXE_OUT = os.path.join(DIST_DIR, "PromptSprite.exe")
 DEV_DB = os.path.join(ROOT, "data", "prompts.db")                  # 开发态主库（最新数据）
 BUILTIN_DB = os.path.join(ROOT, "app", "resources", "builtin_prompts.db")  # 内嵌库（打包进 EXE）
-DIST_DB = os.path.join(ROOT, "dist", "data", "prompts.db")         # EXE 旁数据文件夹
+DIST_DB = os.path.join(DIST_DIR, "data", "prompts.db")             # EXE 旁数据文件夹
 
 # 优先使用 .venv 的解释器，其次使用当前解释器
 VENV_PY = os.path.join(ROOT, ".venv", "Scripts", "python.exe")
 PY = VENV_PY if os.path.isfile(VENV_PY) else sys.executable
+
+
+def _load_version() -> str:
+    """从 app/config.py 读取 APP_VERSION（打包文件名需带版本号，2026-09-07 第7条）"""
+    try:
+        cfg_path = os.path.join(ROOT, "app", "config.py")
+        with open(cfg_path, encoding="utf-8") as f:
+            m = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', f.read())
+        return m.group(1) if m else "0.0.0"
+    except Exception:
+        return "0.0.0"
+
+
+def versioned_exe_path() -> str:
+    """EXE 产物文件名格式：PromptSprite_<最后修改日期YYMMDD>_V<版本号>.EXE
+    （2026-09-07 第7条，如 PromptSprite_260907_V1.6.0.EXE）"""
+    tag = datetime.now().strftime("%y%m%d")
+    return os.path.join(DIST_DIR, f"PromptSprite_{tag}_V{_load_version()}.exe")
 
 
 def _run(args, cwd=None):
@@ -99,10 +121,23 @@ def main() -> None:
     print("[6/7] 更新 EXE 旁数据文件夹 dist/data ...")
     _update_dist_data()
 
+    # 6.5 按新命名规则归档 EXE（2026-09-07 第7条）：
+    # PromptSprite_<最后修改日期YYMMDD>_V<版本号>.EXE，如 PromptSprite_260907_V1.6.0.EXE
+    target = versioned_exe_path()
+    if not os.path.isfile(EXE_OUT):
+        print("未找到产物，请查看上方错误信息。")
+        sys.exit(1)
+    if os.path.abspath(target) != os.path.abspath(EXE_OUT):
+        if os.path.isfile(target):   # 同日同版本已存在 → 先移除再改名，避免被 PyInstaller 占用
+            os.remove(target)
+        os.rename(EXE_OUT, target)
+    else:
+        target = EXE_OUT
+
     # 7. 校验产物
-    if os.path.isfile(EXE_OUT):
-        size_mb = os.path.getsize(EXE_OUT) / 1024 / 1024
-        print(f"=== 打包完成：{EXE_OUT}（{size_mb:.1f} MB）===")
+    if os.path.isfile(target):
+        size_mb = os.path.getsize(target) / 1024 / 1024
+        print(f"=== 打包完成：{target}（{size_mb:.1f} MB）===")
         print("已内置最新完整数据库；首次运行自动在 exe 同目录生成/复用 data/。")
         print("全局热键需管理员权限或杀毒软件白名单（失败不影响其他功能）。")
     else:
