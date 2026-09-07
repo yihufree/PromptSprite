@@ -135,7 +135,7 @@ PromptSprite/
 │   └── resources/
 │       ├── builtin_manual.md      # 内置手册（90 条）
 │       └── builtin_prompts.db     # 内置完整数据库（打包时由 build.py 生成）
-├── docs/                     # 需求规格V7 / 审核报告V6 / 说明书V6 / 打包指南V7 / 设计·施工方案 / 开发记录
+├── docs/                     #  说明书V6 / 打包指南V7 / 
 ├── Icons/PSicon.png          # 应用图标源
 ├── build.py                  # 一键打包（装依赖→生成图标→内嵌最新库→PyInstaller→校验）
 ├── run.py                    # 根目录启动器（等效 python -m app.main）
@@ -155,7 +155,6 @@ PromptSprite/
 | ---- | ---- |
 | [软件安装使用说明书（V6）](docs/20260829_软件安装使用说明书_v6.md) | 面向小白的完整使用指南 |
 | [打包发布指南（V7）](docs/20260829_打包发布指南_v7.md) | 打包与 GitHub Releases 发布全流程 |
-| [开发工作记录 06](20260829_PromptSprite_06_开发工作记录.md) | 2026-08-29 起记录卷（第 009 条起） |
 
 ---
 
