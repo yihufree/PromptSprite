@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS deletion_log (
     name        TEXT DEFAULT '',        -- 被删对象名称
     chain       TEXT DEFAULT '',        -- JSON 名称链（一级/二级…），entry/category 用
     content_key TEXT DEFAULT '',        -- 条目"详情内容"判重键（entry 用）
+    payload     TEXT DEFAULT '',        -- 2026-09-08（V1.7.0）：被删条目完整快照(JSON)，支持"携带被删快照"导出/⑤逆向恢复
     deleted_at  TEXT
 );
 
@@ -184,6 +185,10 @@ class Database:
             " id INTEGER PRIMARY KEY AUTOINCREMENT,"
             " kind TEXT NOT NULL, name TEXT DEFAULT '', chain TEXT DEFAULT '',"
             " content_key TEXT DEFAULT '', deleted_at TEXT)")
+        # 2026-09-08（V1.7.0）：删除日志补 payload 列（被删条目完整快照，⑤逆向恢复用）
+        if not self._has_column("deletion_log", "payload"):
+            self.conn.execute(
+                "ALTER TABLE deletion_log ADD COLUMN payload TEXT DEFAULT ''")
         # 2026-09-07（条目多位置施工）：存量库幂等补建 entry_links 表 + 索引
         self.conn.executescript(
             "CREATE TABLE IF NOT EXISTS entry_links ("
@@ -272,17 +277,6 @@ class Database:
         for name in PRESET_DOMAINS:
             self.add_domain(name)
         self.assign_domains_to_projects(PROJECT_DOMAIN_MAPPING)
-
-    def reset_content(self) -> None:
-        """清除全部分类与条目（保留根目录与元信息）。
-
-        2026-08-18（第020条，P2-R1 标注）：自 P0-2 起内置手册升级已改为"非破坏性合并"
-        （见 md_parser.import_manual），本方法已无任何调用方，标记为【已废弃】，仅供
-        需要时手动全量重建使用；常规流程不得调用（会清空用户数据）。
-        """
-        self.conn.execute("DELETE FROM categories")  # 关联表 domain_category 级联清理
-        self.conn.execute("DELETE FROM entries")
-        self.conn.commit()
 
     # ------------------------------------------------------------------ #
     # 元信息
@@ -550,13 +544,18 @@ class Database:
 
     def _log_deletion(self, kind: str, name: str = "",
                       chain: Optional[list] = None,
-                      content_key: str = "") -> None:
-        """写入删除日志（kind: entry/category/domain）"""
+                      content_key: str = "",
+                      payload: str = "") -> None:
+        """写入删除日志（kind: entry/category/domain）。
+
+        payload（2026-09-08 V1.7.0）：条目被删时写入完整快照(JSON)，供"携带被删快照"
+        变更包导出与⑤逆向恢复；分类/根目录等非条目删除传空。
+        """
         self.conn.execute(
-            "INSERT INTO deletion_log(kind, name, chain, content_key, deleted_at) "
-            "VALUES(?, ?, ?, ?, ?)",
+            "INSERT INTO deletion_log(kind, name, chain, content_key, payload, deleted_at) "
+            "VALUES(?, ?, ?, ?, ?, ?)",
             (kind, name, json.dumps(chain or [], ensure_ascii=False),
-             content_key, _now()),
+             content_key, payload or "", _now()),
         )
 
     def list_deletions_since(self, since: str) -> List[dict]:
@@ -817,6 +816,7 @@ class Database:
                 "entry", entry["name"],
                 chain=self._category_name_chain(entry["category_id"]) if entry.get("category_id") else [],
                 content_key=self.content_key(entry),
+                payload=json.dumps(dict(entry), ensure_ascii=False),  # V1.7.0：完整快照(⑤逆向恢复)
             )
         self.conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
         self.conn.commit()
@@ -911,7 +911,11 @@ class Database:
             raise
 
     def purge_trash(self, trash_id: int) -> None:
-        """彻底删除回收站中的一条（连同其关联图片文件释放）"""
+        """彻底删除回收站中的一条（连同其关联图片文件释放）。
+
+        2026-09-09（审核 P1-7 修复）：同时清空 deletion_log 中同内容的 payload 快照，
+        缩短"以为已彻底删除、实则可被变更包快照导出"的隐私窗口（保留名称/链/指纹以便同步）。
+        """
         row = self.conn.execute("SELECT * FROM trash WHERE id = ?", (trash_id,)).fetchone()
         if not row:
             return
@@ -922,11 +926,20 @@ class Database:
         img = payload.get("image_path") if isinstance(payload, dict) else ""
         if img:
             self._remove_image_file(img)
+        if isinstance(payload, dict) and payload:
+            try:
+                key = self.content_key(payload)
+                if key:
+                    self.conn.execute(
+                        "UPDATE deletion_log SET payload = '' "
+                        "WHERE kind = 'entry' AND content_key = ?", (key,))
+            except Exception:
+                pass
         self.conn.execute("DELETE FROM trash WHERE id = ?", (trash_id,))
         self.conn.commit()
 
     def clear_trash(self) -> int:
-        """清空回收站（返回清理条数）"""
+        """清空回收站（返回清理条数）；2026-09-09（P1-7）：同步清除 deletion_log 快照 payload"""
         items = self.conn.execute("SELECT id, payload FROM trash").fetchall()
         for it in items:
             try:
@@ -934,12 +947,76 @@ class Database:
                 img = payload.get("image_path") if isinstance(payload, dict) else ""
                 if img:
                     self._remove_image_file(img)
+                if isinstance(payload, dict) and payload:
+                    try:
+                        key = self.content_key(payload)
+                        if key:
+                            self.conn.execute(
+                                "UPDATE deletion_log SET payload = '' "
+                                "WHERE kind = 'entry' AND content_key = ?", (key,))
+                    except Exception:
+                        pass
             except (TypeError, ValueError):
                 pass
         n = self.conn.execute("SELECT COUNT(*) FROM trash").fetchone()[0]
         self.conn.execute("DELETE FROM trash")
         self.conn.commit()
         return n
+
+    def trash_entries_batch(self, entry_ids: list, reason: str = "变更包删除同步",
+                            log_deletion: bool = True) -> int:
+        """批量把条目移入回收站（2026-09-08 V1.7.0：变更包删除同步用）。
+
+        与 trash_entry 语义一致（完整快照入 trash、保留图片、写删除日志），
+        但全部操作在**单事务**内完成，避免逐条 commit 的性能开销。
+        log_deletion（2026-09-09 P2-13）：本机删除/级联删除传 True（需广播）；
+        "变更包删除同步"传 False——接收端不把同步删除再写成"本机删除"，
+        避免本机当日变更包出现"回声删除"（负增量噪音）。
+        已不存在/重复 id 自动忽略；返回实际移入条数。
+        """
+        seen, del_ids = set(), []
+        for eid in entry_ids:
+            if eid is None or eid in seen:
+                continue
+            seen.add(eid)
+            del_ids.append(eid)
+        if not del_ids:
+            return 0
+        now = _now()
+        trash_rows, log_rows, alive = [], [], []
+        for eid in del_ids:
+            e = self.get_entry(eid)
+            if not e:
+                continue
+            payload = dict(e)
+            payload["locations"] = self._entry_location_ids(eid)
+            payload["chain"] = (self._category_name_chain(e["category_id"])
+                                if e.get("category_id") else [])
+            payload_json = json.dumps(payload, ensure_ascii=False)
+            trash_rows.append((e["name"], payload_json, now, reason))
+            if log_deletion:
+                log_rows.append(("entry", e["name"],
+                                 json.dumps(payload["chain"], ensure_ascii=False),
+                                 self.content_key(e), payload_json, now))
+            alive.append(eid)
+        if not alive:
+            return 0
+        ph = ",".join("?" * len(alive))
+        try:
+            with self.conn:
+                self.conn.executemany(
+                    "INSERT INTO trash(name, payload, deleted_at, reason) VALUES(?, ?, ?, ?)",
+                    trash_rows)
+                if log_deletion and log_rows:
+                    self.conn.executemany(
+                        "INSERT INTO deletion_log(kind, name, chain, content_key, payload, "
+                        "deleted_at) VALUES(?, ?, ?, ?, ?, ?)", log_rows)
+                self.conn.execute(
+                    f"DELETE FROM entries WHERE id IN ({ph})", alive)
+            return len(alive)
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def list_entries_added_since(self, since: str) -> List[dict]:
         """按 created_at >= since 列出最近新增的条目（第3条改进：查看添加历史）"""

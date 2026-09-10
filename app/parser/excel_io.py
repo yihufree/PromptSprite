@@ -116,6 +116,9 @@ def import_excel(db, path, progress_cb=None) -> dict:
         for r in rows:
             name = str(r[col["名称"]] or "").strip()
             if not name:
+                processed += 1  # 2026-09-09（P2-16）：空行也推进进度，保证进度条走满
+                if progress_cb:
+                    progress_cb(processed, total, "（空行，跳过）")
                 continue
             cid = resolve_category_path(
                 db,

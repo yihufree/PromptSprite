@@ -22,11 +22,10 @@ from ..models import Entry
 
 _HOVER_MS = 200  # 悬停锁定判定时长（秒级换算：0.2 秒）
 
-# "新增"辅助按钮样式（与主界面一致：浅色底 + 深色字）
-_ADD_STYLE = dict(fg_color="#e8ecf1", hover_color="#d5dce5", text_color="#1f2937")
-
-# 选中态样式（与主界面一致：比默认按钮颜色稍稍加深，突出 根目录→一级→二级 选中链路）
-_SEL_STYLE = dict(fg_color="#25639c", hover_color="#1d4f7c", text_color="white")
+# "新增"辅助按钮样式 / 选中态样式（2026-09-09 P2-12：与主窗口共用公共样式）
+from .ui_common import ADD_BTN_STYLE as _ADD_STYLE
+from .ui_common import SEL_BTN_STYLE as _SEL_STYLE
+from .ui_common import install_edit_capability as _enable_text_undo  # 2026-09-09：文本框撤销/重做
 
 
 class _Tip:
@@ -197,6 +196,8 @@ class QuickAddWindow(ctk.CTkToplevel):
                       command=self._save).pack(side="left", padx=8, pady=8)
         ctk.CTkButton(footer, text="清空表单", width=100,
                       command=self._clear_form).pack(side="left", padx=4, pady=8)
+        # 2026-09-09：表单各文本框启用撤销(Ctrl+Z)/重做(Ctrl+Y)
+        _enable_text_undo(form)
 
     # ------------------------------------------------------------------ #
     # 悬停联动

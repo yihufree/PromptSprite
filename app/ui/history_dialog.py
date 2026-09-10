@@ -231,7 +231,7 @@ class RecentAdditionsDialog(ctk.CTkToplevel):
 
         foot = ctk.CTkFrame(self, fg_color="transparent")
         foot.pack(fill="x", padx=16, pady=(4, 12))
-        ctk.CTkLabel(foot, text="双击某行可复制全部提示词",
+        ctk.CTkLabel(foot, text="提示：复制请使用右侧 中文/英文/全部 按钮",
                      text_color="gray", font=("Microsoft YaHei", 11)
                      ).pack(side="left")
         ctk.CTkButton(foot, text="关闭", width=80,

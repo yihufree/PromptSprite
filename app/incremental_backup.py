@@ -1,18 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-incremental_backup.py - 每日增量数据备份（2026-08-29 施工新增，M4）
-
+incremental_backup.py - 每日变更包备份（2026-08-29 施工新增 M4；2026-09-08 V1.7.0 更名+加固）
 需求（用户）：
-  - 每台电脑有"电脑代号"，每次关闭软件时对"当日新增/修改"的数据做增量备份；
-  - 当日再次打开新增数据后退出，更新当日增量备份文件（幂等重生成，非追加）；
-  - 文件名含电脑代号与日期：增量_{电脑代号}_{YYYY-MM-DD}.json；
-  - 可换机导入合并（JSON v3，复用 json_io.import_json 内容判重）。
+  - 每台电脑有"电脑代号"，每次关闭软件时对"当日新增/修改"的数据做变更包备份；
+  - 当日再次打开新增数据后退出，更新当日变更包文件（幂等重生成，非追加）；
+  - 文件名 = 变更包_{电脑代号}_{YYYY-MM-DD}_add_{新增/修改条目数}_del_{删除条目数}.json，
+    让"正增量/负增量"一眼可读（删除清零、无新增时如 _add_0_del_1380 即为纯删除包）；
+  - 包内含 version4 + summary 元信息；可换机导入合并（删除清单导入先进回收站，可恢复）。
+  - 变更包覆盖 增/删/改/空分类 全同步；"负增量"（纯删除包）是正常语义而非故障。
 
 设计要点：
-  - 增量基准 = 当日 00:00:00（文件内容为当日全部变更，每次退出重新生成）；
+  - 变更基准 = 当日 00:00:00（文件内容为当日全部变更，每次退出重新生成）；
   - 以条目为数据主体，附带完整分类祖先链 / 根目录 / 项目类别 / domain_links，
     保证换机导入后分类与归属上下文完整；
-  - categories 无时间戳，纯"新增空分类"不在增量内（已记录取舍）。
+  - 同一天重生成时先删除当日旧文件（含旧前缀"增量"遗留），保证"每机每日单文件"。
 
 自测：python -m app.incremental_backup
 """
@@ -65,7 +66,7 @@ def collect_daily_changes(db, day_start: str) -> dict:
 
     返回：{'entries', 'categories', 'domains', 'domain_links',
            'projects', 'domain_projects', 'deleted_entries', 'deleted_categories',
-           'deleted_domains'}
+           'deleted_domains', 'new_categories'}
     """
     entries = db.list_entries_updated_since(day_start)
     cat_ids, dom_ids = set(), set()
@@ -80,7 +81,10 @@ def collect_daily_changes(db, day_start: str) -> dict:
                 for d in db.linked_domains(c["id"]):
                     dom_ids.add(d["id"])
     # 2) 当日新建/修改的分类（含"新增空分类"）→ 自身 + 祖先链（2026-08-29 增强）
+    new_categories = 0
     for c in db.list_categories_changed_since(day_start):
+        if (c.get("created_at") or "") >= day_start:  # created_at≥当日 = 当日新创建
+            new_categories += 1
         for anc in json_io._ancestor_chain_cats(db, c["id"]):
             cat_ids.add(anc["id"])
             if anc["parent_id"] is None:
@@ -100,11 +104,24 @@ def collect_daily_changes(db, day_start: str) -> dict:
         chain = json.loads(log["chain"] or "[]")
         if log["kind"] == "entry":
             deleted_entries.append({"name": log["name"], "chain": chain,
-                                    "content_key": log["content_key"]})
+                                    "content_key": log["content_key"],
+                                    "payload": log.get("payload") or ""})
         elif log["kind"] == "category":
             deleted_categories.append({"name": log["name"], "chain": chain})
         elif log["kind"] == "domain":
             deleted_domains.append({"name": log["name"]})
+    # 2026-09-09（审核 P0-2 修复）：剔除"当前库仍存在同内容条目"的删除项——
+    # 覆盖"回收站恢复后当日删除日志未清"与"当日删除后又重建同内容"两种场景，
+    # 避免换机导入时把恢复/重建的条目再次删除同步。
+    if deleted_entries:
+        from .database import Database
+        try:
+            existing_keys = {Database.content_key(e)
+                             for e in db.list_all_entries()}
+            deleted_entries = [d for d in deleted_entries
+                               if d.get("content_key") not in existing_keys]
+        except Exception:
+            pass  # 过滤失败时保留原清单，尽力而为
     return {
         "entries": entries,
         "categories": cats,
@@ -115,16 +132,58 @@ def collect_daily_changes(db, day_start: str) -> dict:
         "deleted_entries": deleted_entries,
         "deleted_categories": deleted_categories,
         "deleted_domains": deleted_domains,
+        "new_categories": new_categories,
     }
 
 
-def build_json_v3(db, changes: dict, computer_code: str, day: str) -> dict:
-    """组装 JSON v3（兼容 json_io.import_json 导入；含删除清单）"""
+def _change_pack_basename(code: str, day: str, add_entries: int,
+                          del_entries: int) -> str:
+    """变更包文件名：变更包_{电脑代号}_{日期}_add_{新增/修改条目}_del_{删除条目}.json。
+
+    add/del 按"条目"计（与用户"条目数"心智一致；分类/根目录增减见包内 summary）。
+    例如：变更包_DESKTOP-053MORJ_2026-09-08_add_0_del_1380.json（负增量/纯删除包）。
+    """
+    return (f"{config.INCR_FILE_PREFIX}_{code}_{day}"
+            f"_add_{int(add_entries)}_del_{int(del_entries)}.json")
+
+
+def build_json_v4(db, changes: dict, computer_code: str, day: str,
+                  include_snapshot: bool = False) -> dict:
+    """组装变更包 JSON v4（含 type/summary 元信息 + 删除清单；兼容 json_io.import_json 导入）。
+
+    include_snapshot（2026-09-08 V1.7.0，默认关）：True 时把被删条目完整快照写入
+    deleted_entries[].snapshot，供"⑤ 逆向恢复"；开启会使包体积增大且含已删内容（隐私敏感）。
+    """
+    del_entries = len(changes["deleted_entries"])
+    del_categories = len(changes["deleted_categories"])
+    del_domains = len(changes["deleted_domains"])
+    deleted_entries_out = []
+    for de in changes["deleted_entries"]:
+        item = {"name": de["name"], "chain": de["chain"],
+                "content_key": de["content_key"]}
+        if include_snapshot and de.get("payload"):
+            try:
+                snap = json.loads(de["payload"])
+                item["snapshot"] = snap
+            except (TypeError, ValueError):
+                pass
+        deleted_entries_out.append(item)
     return {
         "version": json_io.JSON_VERSION,
+        "type": "change",
         "exported_at": _now(),
         "computer_code": computer_code,
         "day": day,
+        "summary": {
+            "add_entries": len(changes["entries"]),
+            "add_categories": changes.get("new_categories", 0),
+            "add_domains": 0,
+            "del_entries": del_entries,
+            "del_categories": del_categories,
+            "del_domains": del_domains,
+            "deleted_snapshots": sum(1 for de in deleted_entries_out
+                                     if de.get("snapshot")),
+        },
         "projects": [{"name": p["name"], "sort_order": p["sort_order"]}
                      for p in changes["projects"]],
         "domain_projects": changes["domain_projects"],
@@ -136,14 +195,29 @@ def build_json_v3(db, changes: dict, computer_code: str, day: str) -> dict:
                         "name": c["name"], "sort_order": c["sort_order"]}
                        for c in changes["categories"]],
         "entries": [json_io._entry_payload(db, e) for e in changes["entries"]],
-        "deleted_entries": changes["deleted_entries"],
+        "deleted_entries": deleted_entries_out,
         "deleted_categories": changes["deleted_categories"],
         "deleted_domains": changes["deleted_domains"],
     }
 
 
+def _remove_today_files(directory: str, code: str, day: str) -> None:
+    """删除当日已有变更包文件（含旧前缀"增量"遗留），保证"每机每日单文件"。失败静默。"""
+    try:
+        prefixes = (f"{config.INCR_FILE_PREFIX}_{code}_{day}_",
+                    f"{config.INCR_LEGACY_PREFIX}_{code}_{day}_")
+        for f in os.listdir(directory):
+            if any(f.startswith(p) and f.endswith(".json") for p in prefixes):
+                try:
+                    os.remove(os.path.join(directory, f))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
 def write_incremental(db) -> dict:
-    """生成/更新当日增量备份文件（幂等重生成）。返回 {'ok','path','entries','error'}。
+    """生成/更新当日变更包文件（幂等重生成，文件名含增删计数）。返回 {'ok','path','entries','error'}。
 
     失败不抛异常（供退出流程静默调用，状态栏/日志提示即可）。
     """
@@ -161,10 +235,21 @@ def write_incremental(db) -> dict:
         if not has_changes:
             result["ok"] = True   # 无当日变化：跳过写入，不算失败
             return result
-        data = build_json_v3(db, changes, code, day)
+        # 2026-09-08（V1.7.0）：是否携带被删快照（默认关；开启后包内含已删内容，隐私敏感）
+        try:
+            include_snap = (db.get_meta(config.META_CHANGE_PACK_SNAPSHOT) or "0") == "1"
+        except Exception:
+            include_snap = False
+        data = build_json_v4(db, changes, code, day, include_snapshot=include_snap)
         directory = incr_dir(db)
         os.makedirs(directory, exist_ok=True)
-        path = os.path.join(directory, f"{config.INCR_FILE_PREFIX}_{code}_{day}.json")
+        # 2026-09-08（V1.7.0）：文件名带 add/del 计数，让正/负增量一眼可读；
+        # 同一天重生成先删除当日旧文件，保证"每机每日单文件"。
+        _remove_today_files(directory, code, day)
+        fname = _change_pack_basename(code, day,
+                                      add_entries=len(changes["entries"]),
+                                      del_entries=len(changes["deleted_entries"]))
+        path = os.path.join(directory, fname)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         try:  # 保留天数优先取用户设置
@@ -180,11 +265,14 @@ def write_incremental(db) -> dict:
 
 
 def _cleanup_old(directory: str, keep_days: int = config.INCR_KEEP_DAYS) -> None:
-    """删除超过保留天数的增量文件（按文件修改时间）"""
+    """删除超过保留天数的变更包文件（按文件修改时间；同时清理旧前缀"增量"遗留文件）"""
     try:
         now = datetime.now().timestamp()
         for f in os.listdir(directory):
-            if not f.startswith(config.INCR_FILE_PREFIX) or not f.endswith(".json"):
+            if not f.endswith(".json"):
+                continue
+            if not (f.startswith(config.INCR_FILE_PREFIX)
+                    or f.startswith(config.INCR_LEGACY_PREFIX)):
                 continue
             path = os.path.join(directory, f)
             try:
@@ -247,52 +335,62 @@ def _selftest() -> None:
             # 2. 无当日数据 → 跳过
             r = write_incremental(db)
             assert r["ok"] and r["entries"] == 0, r
-            # 3. 当日新增 → 生成文件
+            # 3. 当日新增 → 生成文件（v4 变更包，文件名含 add/del 计数）
             e1_id = db.add_entry(Entry(name="增量条目1", category_id=l2))
             r2 = write_incremental(db)
             assert r2["ok"] and r2["entries"] == 1 and r2["path"], r2
             path = r2["path"]
             assert os.path.isfile(path)
+            assert os.path.basename(path).endswith("_add_1_del_0.json"), os.path.basename(path)
             data = json.load(open(path, encoding="utf-8"))
             assert data["version"] == json_io.JSON_VERSION
+            assert data["type"] == "change"
+            assert data["summary"]["add_entries"] == 1
+            assert data["summary"]["del_entries"] == 0
             assert data["computer_code"] == code
             assert "domain_projects" in data and data["projects"]
-            print("[1] 电脑代号/生成增量文件 OK:", os.path.basename(path))
-            # 4. 再增数据 → 重生成（当日全集，幂等）
+            print("[1] 电脑代号/生成变更包文件 OK:", os.path.basename(path))
+            # 4. 再增数据 → 重生成（当日全集，幂等；文件名随计数变化且当日仅一个文件）
             e2_id = db.add_entry(Entry(name="增量条目2", category_id=l2))
             r3 = write_incremental(db)
             assert r3["entries"] == 2, r3
-            data3 = json.load(open(path, encoding="utf-8"))
+            assert os.path.basename(r3["path"]).endswith("_add_2_del_0.json")
+            today_files = [f for f in os.listdir(incr_dir(db))
+                           if f.startswith(config.INCR_FILE_PREFIX)]
+            assert len(today_files) == 1, today_files
+            data3 = json.load(open(r3["path"], encoding="utf-8"))
             assert len(data3["entries"]) == 2
-            print("[2] 增量文件更新(当日全集) OK")
+            print("[2] 变更包更新(当日全集+当日单文件) OK")
             # 5. 换机导入合并（判重）：新库导入 → 2 条；再导入 → 全跳过
             db2 = Database(os.path.join(tmp, "t2.db"))
             try:
-                st = json_io.import_json(db2, path)
+                st = json_io.import_json(db2, r3["path"])
                 assert st["entries"] == 2, st
-                st2 = json_io.import_json(db2, path)
+                st2 = json_io.import_json(db2, r3["path"])
                 assert st2["entries"] == 0 and st2["skipped"] == 2, st2
                 print("[3] 换机导入合并+判重 OK")
             finally:
                 db2.close()
-            # 6. 增量 → Excel/HTML 浏览导出
+            # 6. 变更包 → Excel/HTML 浏览导出
             out_x = os.path.join(tmp, "incr.xlsx")
             out_h = os.path.join(tmp, "incr.html")
-            n1 = export_incremental_to(db, path, out_x, "excel")
-            n2 = export_incremental_to(db, path, out_h, "html")
+            n1 = export_incremental_to(db, r3["path"], out_x, "excel")
+            n2 = export_incremental_to(db, r3["path"], out_h, "html")
             assert n1 == 2 and n2 == 2, (n1, n2)
             assert os.path.isfile(out_x) and os.path.isfile(out_h)
             print("[4] 增量导出 Excel/HTML 浏览 OK")
-            # 7. 保留天数清理
+            # 7. 保留天数清理（新前缀 变更包 与 旧前缀 增量 遗留 一并清理）
             from datetime import timedelta
-            old = os.path.join(incr_dir(db), f"增量_{code}_2000-01-01.json")
-            with open(old, "w", encoding="utf-8") as f:
-                f.write("{}")
-            old_ts = (datetime.now() - timedelta(days=31)).timestamp()
-            os.utime(old, (old_ts, old_ts))
+            old1 = os.path.join(incr_dir(db), f"{config.INCR_FILE_PREFIX}_{code}_2000-01-01.json")
+            old2 = os.path.join(incr_dir(db), f"{config.INCR_LEGACY_PREFIX}_{code}_2000-01-01.json")
+            for old in (old1, old2):
+                with open(old, "w", encoding="utf-8") as f:
+                    f.write("{}")
+                old_ts = (datetime.now() - timedelta(days=31)).timestamp()
+                os.utime(old, (old_ts, old_ts))
             _cleanup_old(incr_dir(db), 30)
-            assert not os.path.isfile(old)
-            print("[5] 超期清理 OK")
+            assert not os.path.isfile(old1) and not os.path.isfile(old2)
+            print("[5] 超期清理(变更包+旧增量遗留) OK")
 
             # 6. 新增空分类 → 增量文件应包含（2026-08-29 增强）
             empty_cat = db.add_category("空分类X", domain_id=doms[0]["id"])

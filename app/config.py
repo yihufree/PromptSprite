@@ -8,7 +8,9 @@ import sys
 
 # ---------- 应用基础信息 ----------
 APP_NAME = "PromptSprite"
-APP_VERSION = "1.6.0"  # 2026-09-07（改进细节）：初始导航仅显示项目类别/悬浮提速/删除按钮移至详情底部/分类滚动复位/详情字段彩色分区/补充GitHub仓库地址
+# 2026-09-10：V1.8.0 —— 界面与体验修订（工具栏重排/目录隐藏显示/编辑浏览切换/搜索防抖/
+# 悬停条目名浮层/动态窗口最小宽度/详情命令条调整），数据格式与库结构完全不变。
+APP_VERSION = "1.8.0"
 
 # ---------- 数据库 / 目录 ----------
 DB_FILE_NAME = "prompts.db"
@@ -51,7 +53,9 @@ DETAIL_MODE_FULL = "full"       # 始终全部显示
 DETAIL_MODE_COMPACT = "compact" # 始终精简（隐藏 ③-⑦）
 
 # ---------- 自动备份 ----------
-BACKUP_KEEP_COUNT = 5
+# 2026-09-08（V1.7.0 备份策略）：默认保留 30 份；按天去重（同日只留最后一份）；
+# 清理仅针对标准命名 prompts_YYYY-MM-DD_*.db，手动快照（snapshot_* 等）永不清理。
+BACKUP_KEEP_COUNT = 30
 
 # ---------- 项目类别（四级分类最高层级，2026-08-29 施工新增） ----------
 # 预置项目类别（最高层级）
@@ -67,13 +71,17 @@ PROJECT_DOMAIN_MAPPING = {
     "个人经验总结": ["计算机编程"],
 }
 
-# ---------- 增量备份（2026-08-29 施工新增） ----------
+# ---------- 每日变更包（原"增量备份"，2026-08-29 新增 / 2026-09-08 V1.7.0 更名+计数命名）----------
 INCR_DIR_NAME = "incremental"          # data/backup/incremental/
 INCR_KEEP_DAYS = 30                    # 增量备份文件按日保留天数（用户确认）
-INCR_FILE_PREFIX = "增量"
+INCR_FILE_PREFIX = "变更包"            # 文件名前缀（原"增量"）：变更包_电脑代号_日期_addN_delM.json
 META_COMPUTER_CODE = "settings_computer_code"   # 电脑代号
 META_INCR_LAST_SYNC = "incr_last_sync"          # 增量备份游标
 META_INCR_KEEP_DAYS = "settings_incr_keep_days" # 增量备份保留天数（用户设置，默认 INCR_KEEP_DAYS）
+META_BACKUP_KEEP = "settings_backup_keep"       # 自动全量备份保留份数（用户设置，默认 BACKUP_KEEP_COUNT；2026-09-08 V1.7.0）
+META_CHANGE_PACK_SNAPSHOT = "settings_change_pack_snapshot"  # 变更包是否携带被删快照（"1"/"0"，默认关；支持⑤逆向恢复，2026-09-08 V1.7.0）
+# 旧前缀（"增量"）仅用于清理历史遗留文件，避免遗留文件不被清理
+INCR_LEGACY_PREFIX = "增量"
 META_MIGRATE_MAPPING_VER = "migrate_mapping_version"  # 迁移映射表版本
 META_MIGRATE_WIZARD_DISMISSED = "migrate_wizard_dismissed"  # 迁移向导是否已取消过（避免每次启动打扰）
 

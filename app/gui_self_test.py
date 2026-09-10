@@ -168,10 +168,11 @@ def main():
         check("name label ① 条目名称",
               any("① 条目名称" in text_of(x) for x in labels))
 
-        # 顶部命令条顺序（像素）
+        # 顶部命令条顺序（像素）——"🗑 删除"已移到底部常驻栏，不再出现在命令条
+        # 2026-09-10（用户要求）："☆ 收藏"与"编辑/浏览"互换位置 → 收藏在最左
         app.update()
         row1 = app.detail_head.winfo_children()[0]
-        want = ("➜ 移动到…", "↔ 关联到…", "⧉ 复制到…", "☆ 收藏", "🗑 删除")
+        want = ("☆ 收藏", "➜ 移动到", "↔ 关联到", "⧉ 复制到")
         pos = {}
         for child in row1.winfo_children():
             if type(child).__name__ == "CTkButton" and child.cget("text") in want:
@@ -182,10 +183,10 @@ def main():
               and app.link_btn.cget("state") == "normal"
               and app.copyto_btn.cget("state") == "normal")
 
-        # 多位置提示行
+        # 多位置提示行（chips 文案形如 "主 · …" / "关联 · …"）
         tags = [text_of(x) for x in labels]
-        check("hint 主 tag", any("主·" in s for s in tags))
-        check("hint 关联 tag", any("关联·" in s for s in tags))
+        check("hint 主 tag", any("主 ·" in s for s in tags))
+        check("hint 关联 tag", any("关联 ·" in s for s in tags))
         btn_count = 0
         def _count_x(w):
             nonlocal btn_count
@@ -199,16 +200,17 @@ def main():
         _count_x(app.detail_scroll)
         check("hint one remove btn", btn_count == 1)
 
-        # 精简模式合并顶栏行
-        scroll_kids = app.detail_scroll.winfo_children()
-        first = scroll_kids[0] if scroll_kids else None
-        if first is not None and len([c for c in first.winfo_children()
-                                      if type(c).__name__ in ("CTkLabel", "CTkButton")]) >= 2:
-            dlabels = [text_of(c) for c in first.winfo_children()
-                       if type(c).__name__ == "CTkLabel"]
-            check("compact header row", any("详情 · 精简模式" in t for t in dlabels))
-        else:
-            check("compact header row", False)
+        # 固定头部状态行（详情区顶部恒常显示，不随滚动消失，只作用于 ②~⑦）
+        check("固定头部状态行存在",
+              getattr(app, "detail_state_lbl", None) is not None
+              and app.detail_state_lbl.cget("text") == "详情 · 精简模式"
+              and getattr(app, "show_all_btn", None) is not None
+              and app.show_all_btn.cget("text") == "⏵ 显示全部字段")
+        # ②~⑦ 折叠组默认折叠（标题条内有自己的"展开"按钮）
+        check("②~⑦ 折叠组默认折叠",
+              app._detail_group_open is False
+              and app._detail_group_toggle is not None
+              and app._detail_group_toggle.cget("text") == "展开")
 
         # ---- 2. 关联 / 复制 / 移动 / 解除 ----
         app._pick_entry_targets = lambda mode, eid: [l_leaf]
