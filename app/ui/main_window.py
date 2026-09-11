@@ -25,7 +25,7 @@ import tkinter as tk
 import webbrowser  # 2026-08-18（第015条）：详情"⑩图像获取方案"打开链接按钮
 from datetime import datetime  # 2026-08-29（M4）：增量备份文件名日期
 from tkinter import filedialog, messagebox, simpledialog
-from typing import Optional
+from typing import List, Optional  # 2026-09-11：List 供分类列排序辅助方法标注类型
 
 import customtkinter as ctk
 import pyperclip
@@ -131,6 +131,17 @@ _ADD_FOLD_KEYS = set(config.DETAIL_HIDDEN_KEYS)
 # 折叠后不再各字段各自占行（此前折叠态 ③-⑦ 仍占较大竖向空间）。
 _INFO_GROUP_KEYS = ("intro", "origin", "features", "scenes", "works", "image_desc")
 
+# 2026-09-11 08:52（用户要求 1）：条目列悬停"条目名称一览"浮层在原宽度上增加的像素值。
+# 目的：条目列宽窄导致名称显示不全，需借浮层看全名，故加宽约 150px（≈10-11 个汉字）；
+# 定位时浮层右边与条目列的相对位置保持不变，增加的部分全部向左扩展（见 _show_entry_overview）。
+_ENTRY_OV_EXTRA_W = 150
+
+# 2026-09-11 09:27（用户要求 3）：浮层"条目名称一览"配色——默认配色 +"光标所在条目"深色高亮
+_ENTRY_OV_BG = "#ffffff"       # 默认底色
+_ENTRY_OV_FG = "#111111"       # 默认文字色
+_ENTRY_OV_HL_BG = "#25639c"    # 高亮底色（与浮层标题栏同色）
+_ENTRY_OV_HL_FG = "#ffffff"    # 高亮文字色
+
 
 class _FieldTooltip:
     """字段悬停提示：鼠标移到字段上显示完整内容（不受滚动框裁剪影响）"""
@@ -231,6 +242,10 @@ class MainWindow(ctk.CTk):
         self._entry_ov_after = None
         self._entry_ov_y = None
         self._entry_ov_listbox = None   # 2026-09-10（用户要求 4）：浮层内的列表控件（滚动同步用）
+        # 2026-09-11 09:27（用户要求 3）：浮层内"光标所在条目"深色高亮状态
+        self._entry_ov_ids = []         # 与 _entry_ov_names 一一对应的条目 id（定位高亮行用）
+        self._entry_ov_cur = None       # 光标当前所在条目 id
+        self._entry_ov_hl = None        # 浮层内上一次高亮的行号（恢复默认配色用）
         self._search_after = None       # 2026-09-10（用户要求）：搜索输入防抖定时器 id
 
         self._load_settings()   # 2026-08-18：应用持久化设置（窗口大小/视图模式/详情策略）
@@ -777,6 +792,61 @@ class MainWindow(ctk.CTk):
             _FieldTooltip(btn, name)
 
     # ------------------------------------------------------------------ #
+    # 分类列"上移/下移"（2026-09-11 08:52 用户要求 2）
+    # ------------------------------------------------------------------ #
+    def _column_ids(self, kind: str) -> List[int]:
+        """某分类列当前可见项的 id 顺序（必须与对应 _refresh_* 的渲染顺序一致）。
+
+        kind：project=项目类别列 / domain=根目录列 / l1=一级分类列 / l2=二级分类列。
+        """
+        if kind == "project":
+            return [p["id"] for p in self.db.list_projects()]
+        if kind == "domain":
+            rows = (self.db.list_unassigned_domains() if self._cur_project_id is None
+                    else self.db.list_domains(project_id=self._cur_project_id))
+            return [d["id"] for d in rows]
+        if kind == "l1":
+            if self._cur_domain_id is None:
+                return []
+            return [c["id"] for c in self.db.list_categories(
+                domain_id=self._cur_domain_id, parent_id=None)]
+        parent_id = self._l2_parent_id()
+        if parent_id is None:
+            return []
+        return [c["id"] for c in self.db.list_categories(parent_id=parent_id)]
+
+    def _add_move_menu_items(self, menu, kind: str, item_id: int, lock_state: str) -> None:
+        """在右键菜单末尾追加"上移/下移"两项（已到列首/列尾则置灰）"""
+        ids = self._column_ids(kind)
+        idx = ids.index(item_id) if item_id in ids else -1
+        can = (lock_state == "normal" and idx >= 0)
+        menu.add_separator()
+        menu.add_command(label="⬆ 上移", state=("normal" if (can and idx > 0) else "disabled"),
+                         command=lambda: self._move_in_column(kind, item_id, -1))
+        menu.add_command(label="⬇ 下移",
+                         state=("normal" if (can and idx < len(ids) - 1) else "disabled"),
+                         command=lambda: self._move_in_column(kind, item_id, +1))
+
+    def _move_in_column(self, kind: str, item_id: int, delta: int) -> None:
+        """把某分类列内的项上移/下移一格，随后重建该列（保持选中高亮）"""
+        if self._lock_on:
+            return
+        table = "projects" if kind == "project" else ("domains" if kind == "domain"
+                                                     else "categories")
+        if not self.db.swap_order(table, self._column_ids(kind), item_id, delta):
+            self.toast("已在最" + ("上" if delta < 0 else "下") + "端", color="#D9534F")
+            return
+        if kind == "project":
+            self._refresh_projects()
+        elif kind == "domain":
+            self._refresh_l0()
+        elif kind == "l1":
+            self._refresh_l1()
+        else:
+            self._refresh_l2()
+        self.toast("已上移" if delta < 0 else "已下移")
+
+    # ------------------------------------------------------------------ #
     # 项目类别（四级分类最高层级，2026-08-29 M2 新增）
     # ------------------------------------------------------------------ #
     def _refresh_projects(self) -> None:
@@ -896,6 +966,7 @@ class MainWindow(ctk.CTk):
                           command=lambda: self._rename_project(project_id))
             m.add_command(label="删除", state=lock_state,
                           command=lambda: self._delete_project(project_id))
+            self._add_move_menu_items(m, "project", project_id, lock_state)  # 2026-09-11：上移/下移
         m.tk_popup(event.x_root, event.y_root)
 
     def _add_project(self) -> None:
@@ -1290,6 +1361,8 @@ class MainWindow(ctk.CTk):
         self.entry_frame.configure(label_text=title)
         self._hide_entry_overview()  # 2026-09-09：列表重建前收起"全部条目名"浮层
         self._entry_ov_names = []
+        self._entry_ov_ids = []      # 2026-09-11 09:27（用户要求 3）：浮层高亮定位用
+        self._entry_ov_cur = None    # 2026-09-11 09:27：列表重建后清空"光标所在条目"
         self._clear_frame(self.entry_frame)
 
         # 2026-09-06：浏览视图离开新增目标时，退出"新增条目"态并清空残留空表单
@@ -1330,6 +1403,7 @@ class MainWindow(ctk.CTk):
             for e in entries:
                 self._add_row(e)
         self._entry_ov_names = [e["name"] for e in entries]  # 2026-09-09：悬停浮层数据
+        self._entry_ov_ids = [e["id"] for e in entries]      # 2026-09-11 09:27（用户要求 3）：高亮定位
         self._scroll_top(self.entry_frame)  # 2026-09-07（第4条改进）：切换分类后条目列回到顶部
 
     def _add_card(self, e: dict) -> None:
@@ -1369,6 +1443,8 @@ class MainWindow(ctk.CTk):
         def _hover(_ev, ent=e):
             self._schedule_select(_HOVER_SELECT_MS, lambda: self._select_entry(ent["id"]))
             self._status_hover_entry(ent)  # 2026-08-18：状态栏显示条目链路统计
+            # 2026-09-11 09:27（用户要求 3）：记录光标所在条目，供浮层内深色高亮
+            self._entry_ov_set_current(ent["id"])
 
         def _leave(_ev):
             self._cancel_select()
@@ -1402,6 +1478,33 @@ class MainWindow(ctk.CTk):
         self._cancel_entry_overview()
         # 稍长的延迟：快速扫读条目时不至于频繁弹层
         self._entry_ov_after = self.after(500, self._show_entry_overview)
+
+    def _entry_ov_set_current(self, entry_id) -> None:
+        """记录"光标所在条目"并刷新浮层高亮（2026-09-11 09:27 用户要求 3）"""
+        self._entry_ov_cur = entry_id
+        self._highlight_entry_overview()
+
+    def _highlight_entry_overview(self) -> None:
+        """把光标所在条目在浮层列表中深色高亮（2026-09-11 09:27 用户要求 3）。
+
+        浮层尚未打开时只记录状态；浮层打开后由 _show_entry_overview 调用本方法立即上色，
+        鼠标移到别的条目时再动态切换高亮行。
+        """
+        lb = self._entry_ov_listbox
+        if lb is None or self._entry_ov_cur is None:
+            return
+        try:
+            if not lb.winfo_exists():
+                return
+            idx = self._entry_ov_ids.index(self._entry_ov_cur)
+            if self._entry_ov_hl is not None and self._entry_ov_hl != idx:
+                lb.itemconfig(self._entry_ov_hl, background=_ENTRY_OV_BG,
+                              foreground=_ENTRY_OV_FG)   # 复原上一行默认配色
+            lb.itemconfig(idx, background=_ENTRY_OV_HL_BG, foreground=_ENTRY_OV_HL_FG)
+            self._entry_ov_hl = idx
+            lb.see(idx)   # 条目多于浮层可视行数时，把高亮行滚入可视区
+        except Exception:
+            pass   # 控件已销毁/条目已不在列表时忽略，绝不影响浮层原有行为
 
     def _entry_ov_leave(self, _event=None) -> None:
         # 2026-09-10（用户要求 4-二）：不再直接关闭，改为延时判断光标是否已移到浮层内
@@ -1482,6 +1585,7 @@ class MainWindow(ctk.CTk):
                 pass
             self._entry_ov_popup = None
         self._entry_ov_listbox = None
+        self._entry_ov_hl = None   # 2026-09-11 09:27（用户要求 3）：浮层已销毁，清空高亮行记录
 
     def _show_entry_overview(self) -> None:
         """在条目列左侧浮出当前分类下全部条目名称（可滚动，超长自动横向滚动）。"""
@@ -1503,6 +1607,7 @@ class MainWindow(ctk.CTk):
         width = max(min(max_len + 4, 60), 24)
         lb = tk.Listbox(body, font=("Microsoft YaHei", 10), activestyle="none",
                         width=width, height=min(len(names), 16),
+                        bg=_ENTRY_OV_BG, fg=_ENTRY_OV_FG,   # 2026-09-11 09:27（用户要求 3）：显式配色
                         yscrollcommand=sb.set, borderwidth=0, highlightthickness=0)
         for i, n in enumerate(names, 1):
             lb.insert("end", f"{i}. {n}")
@@ -1515,6 +1620,10 @@ class MainWindow(ctk.CTk):
             wdg.bind("<Leave>", self._entry_ov_leave, add="+")
         popup.update_idletasks()
         w, h = popup.winfo_reqwidth(), popup.winfo_reqheight()
+        # 2026-09-11 08:52（用户要求 1）：在现有宽度基础上加宽约 150px（≈10-11 个汉字）。
+        # 通过显式指定宽度实现：宽度增加后，下方 x 定位仍以"条目列左侧 - w - 4"计算，
+        # 故浮层右边与条目列的相对位置不变，增加的部分全部向左扩展。
+        w += _ENTRY_OV_EXTRA_W
         sw, sh = popup.winfo_screenwidth(), popup.winfo_screenheight()
         # 定位：条目列【左侧】（右侧是详情区，浮层不应盖住它）；超出屏幕左侧则改放右侧
         x = self.entry_frame.winfo_rootx() - w - 4
@@ -1525,9 +1634,11 @@ class MainWindow(ctk.CTk):
         y = self._entry_ov_y or self.entry_frame.winfo_rooty()
         if y + h > sh:
             y = max(sh - h - 8, 0)
-        popup.wm_geometry(f"+{x}+{y}")
+        popup.wm_geometry(f"{w}x{h}+{x}+{y}")  # 2026-09-11 08:52（用户要求 1）：显式宽度以落实加宽
         self._entry_ov_popup = popup
         self._entry_ov_listbox = lb   # 2026-09-10（用户要求 4-一）：滚动同步对象
+        self._entry_ov_hl = None      # 2026-09-11 09:27（用户要求 3）：新浮层无旧高亮行
+        self._highlight_entry_overview()   # 2026-09-11 09:27（用户要求 3）：立即高亮光标所在条目
 
     def _select_entry(self, entry_id: int) -> None:
         if not self._confirm_unsaved():
@@ -2795,6 +2906,7 @@ class MainWindow(ctk.CTk):
                       command=lambda: self._rename_domain(domain_id))
         m.add_command(label="删除", state=lock_state,
                       command=lambda: self._delete_domain(domain_id))
+        self._add_move_menu_items(m, "domain", domain_id, lock_state)  # 2026-09-11：上移/下移
         m.tk_popup(event.x_root, event.y_root)
 
     def _category_menu(self, event, cat_id: int, name: str) -> None:
@@ -2814,6 +2926,8 @@ class MainWindow(ctk.CTk):
                       command=lambda: self._rename_category(cat_id))
         m.add_command(label="删除", state=lock_state,
                       command=lambda: self._delete_category(cat_id))
+        # 2026-09-11（用户要求 2）：一级/二级分类列内上移/下移
+        self._add_move_menu_items(m, src_type, cat_id, lock_state)
         m.tk_popup(event.x_root, event.y_root)
 
     # ------------------------------------------------------------------ #

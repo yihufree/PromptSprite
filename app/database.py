@@ -294,6 +294,49 @@ class Database:
         self.conn.commit()
 
     # ------------------------------------------------------------------ #
+    # 排序（2026-09-11 08:52 用户要求 2）：分类列"上移/下移"
+    # ------------------------------------------------------------------ #
+    _ORDER_TABLES = ("projects", "domains", "categories")  # 允许重排的表白名单（防拼接外部输入）
+
+    def _order_value(self, table: str, row_id: int) -> int:
+        """取某行的 sort_order（不存在时返回 0）"""
+        row = self.conn.execute(
+            f"SELECT sort_order FROM {table} WHERE id = ?", (row_id,)).fetchone()
+        return int(row["sort_order"] or 0) if row else 0
+
+    def swap_order(self, table: str, ordered_ids: List[int], item_id: int,
+                   delta: int) -> bool:
+        """把 item_id 在其所在列内与相邻项对调排序号（-1=上移，+1=下移）。
+
+        ordered_ids 为该列当前的可见顺序（与界面渲染顺序一致）。
+        - 常规：只对调两项的 sort_order 值，不动其它行（避免影响共享分类在其它根目录中的顺序）；
+        - 两项 sort_order 相同（历史并列数据）：先把可见列表按当前顺序物化为 0..n-1 再对调，
+          保证"上移/下移"确实生效；
+        - item_id 不在列表内或已到边界 → 返回 False，不写库。
+        """
+        if table not in self._ORDER_TABLES:
+            raise ValueError(f"不支持重排的表：{table}")
+        if item_id not in ordered_ids:
+            return False
+        i = ordered_ids.index(item_id)
+        j = i + delta
+        if j < 0 or j >= len(ordered_ids):
+            return False
+        a, b = ordered_ids[i], ordered_ids[j]
+        va, vb = self._order_value(table, a), self._order_value(table, b)
+        if va == vb:
+            for k, rid in enumerate(ordered_ids):
+                self.conn.execute(
+                    f"UPDATE {table} SET sort_order = ? WHERE id = ?", (k, rid))
+            va, vb = i, j
+        self.conn.execute(
+            f"UPDATE {table} SET sort_order = ? WHERE id = ?", (vb, a))
+        self.conn.execute(
+            f"UPDATE {table} SET sort_order = ? WHERE id = ?", (va, b))
+        self.conn.commit()
+        return True
+
+    # ------------------------------------------------------------------ #
     # 根目录 Domain
     # ------------------------------------------------------------------ #
     def add_domain(self, name: str, project_id: Optional[int] = None) -> int:
