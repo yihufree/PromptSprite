@@ -228,6 +228,7 @@ class MainWindow(ctk.CTk):
         self._add_target = None      # 新增目标分类 id（None = 未分类）；仅新增态有效
         self._add_group_open = False # 新增态 ③-⑦ 折叠组是否展开
         self._add_group_pairs = []   # 折叠组内的 (标签, 文本框) 对（折叠/展开显隐用）
+        self._add_prompt_toggles = {}  # 2026-09-11（用户要求 1）：新增表单 ⑧/⑨ 展开/收起按钮引用
         self._add_entry_btn = None   # 条目区"➕ 新增条目"按钮引用
 
         # 2026-09-09：详情区 ②~⑦ 折叠组（浏览视图）状态
@@ -1803,14 +1804,14 @@ class MainWindow(ctk.CTk):
                 yield grand
 
     def _install_detail_wheel(self, root_widget) -> None:
-        """把详情区文本框上的滚轮统一转交"详情区滚动"（2026-09-10，用户要求）。
+        """把详情区文本框上的滚轮按"是否已点击激活"分流（2026-09-10 引入，2026-09-11 用户要求 4 修订）。
 
         背景根因：tkinter 的 Text 有**类级** `<MouseWheel>` 绑定，会把滚轮"吞"去滚动
         文本框自身；于是鼠标停在文本框上时详情区（页面）几乎不滚动，用户反馈
         "指针在文本框上滚动失效、只有移到文本框以外才有效"。
-        处理：为详情区（含"＋新增条目"表单）内每个 CTkTextbox 的内部 tk.Text 挂一个
-        **控件级**处理器——统一把滚轮转给详情区画布并 `return "break"`，从而跳过
-        Text 类级绑定与 CTkScrollableFrame 的 bind_all 处理，行为与指针在文本框外一致。
+        2026-09-11（用户要求 4）修订：改为"先点击进入的文本框才滚动自身"——未点击激活
+        （无键盘焦点）时仍整体转给详情区；已点击激活（有键盘焦点）时优先滚动文本框自身，
+        到上/下端或无溢出时继续转给详情区。判定与分流见 _detail_wheel_route。
         需要阅读超长提示词时：点 ⑧/⑨ 的"展开"放大文本框，或用键盘（PageUp/PageDown、
         方向键、Ctrl+Home/End）浏览。
         """
@@ -1823,7 +1824,31 @@ class MainWindow(ctk.CTk):
                 continue
             inner._ps_wheel_ok = True
             inner.bind("<MouseWheel>",
-                       lambda e, c=canvas: self._detail_wheel_to_page(e, c), add="+")
+                       lambda e, t=inner, c=canvas: self._detail_wheel_route(e, t, c),
+                       add="+")
+
+    def _detail_wheel_route(self, event, text_widget, canvas):
+        """详情区文本框滚轮分流（2026-09-11，用户要求 4）。
+
+        激活判定：该文本框是否拥有键盘焦点——点击文本区即会获得焦点，仅悬停/滑过不会，
+        因此"必须先在区域内点击，滚轮才作用于该文本框"。
+        - 未激活：与既有行为一致，滚轮整体转给详情区滚动。
+        - 已激活：先滚动文本框自身（约 20px/格，与详情区步进一致）；若已到上/下端
+          （或内容无溢出、无处可滚），再把该次滚轮转给详情区。
+        始终返回 "break"：阻止 tk.Text 类级绑定与 CTkScrollableFrame 的 bind_all
+        处理，避免"文本框与详情区同时滚动"。
+        """
+        try:
+            if text_widget.focus_get() is text_widget:
+                delta = int(getattr(event, "delta", 0) or 0)
+                if delta:
+                    before = text_widget.yview()
+                    text_widget.yview_scroll(-int(delta / 6), "pixels")
+                    if text_widget.yview() != before:
+                        return "break"
+        except Exception:
+            pass
+        return self._detail_wheel_to_page(event, canvas)
 
     @staticmethod
     def _detail_wheel_to_page(event, canvas):
@@ -2320,6 +2345,7 @@ class MainWindow(ctk.CTk):
         self._detail_dirty = False
         self._add_group_open = False
         self._add_group_pairs = []
+        self._add_prompt_toggles = {}  # 2026-09-11（用户要求 1）：重建表单时清空 ⑧/⑨ 展开按钮引用
         self._browse_mode = False  # 新增必须录入 → 强制编辑模式
         try:
             self.edit_mode_toggle.set("✏️ 编辑")
@@ -2367,29 +2393,56 @@ class MainWindow(ctk.CTk):
     def _add_field_block(self, label: str, key: str, prompt: bool = False) -> None:
         """在新增表单中渲染单个标签 + 文本框；②-⑦ 折叠组之外的字段使用。
 
-        非折叠框沿用详情编辑的像素高度（_FIELDS）；⑧/⑨ 提示词固定 120px≈6 行，
-        便于"内容少时直接填中文提示词"；⑩ 追加"打开"按钮读取网址。
+        非折叠框沿用详情编辑的像素高度（_FIELDS）；⑧/⑨ 提示词默认 _COLLAPSED_H=120px（≈6 行），
+        2026-09-11（用户要求 1）起增加"展开/收起"按钮：点"展开"按内容自适应高度、
+        点"收起"还原 120px，便于编辑/粘贴较长篇幅文档；⑩ 追加"打开"按钮读取网址。
         （2026-09-07 第5条改进：与详情编辑一致的淡彩卡片块样式）
         """
         heights = {k: h for _l, k, h in _FIELDS}
         block, label_c, box_bg, box_border = self._begin_field_block(key)
-        ctk.CTkLabel(block, text=label, text_color=label_c,
-                     font=("Microsoft YaHei", 12, "bold"), anchor="w"
-                     ).pack(fill="x", padx=12, pady=(8, 2))
-        if key == "image_plan":
-            row = ctk.CTkFrame(block, fg_color="transparent")
-            row.pack(fill="x", padx=6, pady=(0, 6))
-            box = ctk.CTkTextbox(row, height=_rows_to_px(heights.get(key, 3)), fg_color=box_bg,
-                                 border_width=1, border_color=box_border, corner_radius=6)
-            box.pack(side="left", fill="x", expand=True)
-            open_btn = ctk.CTkButton(row, text="打开", width=52, height=28,
-                                     command=lambda b=box: self._open_image_plan(b))
-            open_btn.pack(side="right", padx=(6, 0))
-        else:
-            h = 120 if prompt else _rows_to_px(heights.get(key, 3))
-            box = ctk.CTkTextbox(block, height=h, fg_color=box_bg,
+        if prompt:
+            # 2026-09-11（用户要求 1）：⑧/⑨ 标签行右侧增加"展开/收起"按钮；
+            # 默认 120px，展开时按实际内容显示行数自适应（与浏览态 _build_collapsible_field 行为一致）。
+            head = ctk.CTkFrame(block, fg_color="transparent")
+            head.pack(fill="x", padx=10, pady=(8, 0))
+            ctk.CTkLabel(head, text=label, text_color=label_c,
+                         font=("Microsoft YaHei", 12, "bold"), anchor="w"
+                         ).pack(side="left")
+            toggle = ctk.CTkButton(head, text="展开", width=52, height=22, **_ADD_BTN)
+            toggle.pack(side="right")
+            box = ctk.CTkTextbox(block, height=_COLLAPSED_H, fg_color=box_bg,
                                  border_width=1, border_color=box_border, corner_radius=6)
             box.pack(fill="x", padx=6, pady=(0, 6))
+
+            def _toggle_prompt(b=box, t=toggle):
+                expanded = t.cget("text") == "展开"
+                # 无内容时展开仍保持 120px（避免输入框缩成 1 行无法录入）
+                if expanded and b._textbox.get("1.0", "end-1c").strip():
+                    b.configure(height=self._content_fit_height(b))
+                else:
+                    b.configure(height=_COLLAPSED_H)
+                t.configure(text="收起" if expanded else "展开")
+
+            toggle.configure(command=_toggle_prompt)
+            self._add_prompt_toggles[key] = toggle
+        else:
+            ctk.CTkLabel(block, text=label, text_color=label_c,
+                         font=("Microsoft YaHei", 12, "bold"), anchor="w"
+                         ).pack(fill="x", padx=12, pady=(8, 2))
+            if key == "image_plan":
+                row = ctk.CTkFrame(block, fg_color="transparent")
+                row.pack(fill="x", padx=6, pady=(0, 6))
+                box = ctk.CTkTextbox(row, height=_rows_to_px(heights.get(key, 3)), fg_color=box_bg,
+                                     border_width=1, border_color=box_border, corner_radius=6)
+                box.pack(side="left", fill="x", expand=True)
+                open_btn = ctk.CTkButton(row, text="打开", width=52, height=28,
+                                         command=lambda b=box: self._open_image_plan(b))
+                open_btn.pack(side="right", padx=(6, 0))
+            else:
+                box = ctk.CTkTextbox(block, height=_rows_to_px(heights.get(key, 3)),
+                                     fg_color=box_bg, border_width=1,
+                                     border_color=box_border, corner_radius=6)
+                box.pack(fill="x", padx=6, pady=(0, 6))
         box.bind("<KeyRelease>", self._mark_dirty)
         self._detail_boxes[key] = box
         return block
@@ -2461,6 +2514,12 @@ class MainWindow(ctk.CTk):
         self._name_entry.delete(0, "end")
         for key, box in self._detail_boxes.items():
             box.delete("1.0", "end")
+        # 2026-09-11（用户要求 1）：⑧/⑨ 若已"展开"，重置时一并还原为默认 120px（折叠态）
+        for key, toggle in self._add_prompt_toggles.items():
+            box = self._detail_boxes.get(key)
+            if box is not None:
+                box.configure(height=_COLLAPSED_H)
+            toggle.configure(text="展开")
         if self._add_group_open:
             self._toggle_add_group()
         self._detail_dirty = False
