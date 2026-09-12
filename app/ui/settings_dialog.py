@@ -134,7 +134,11 @@ class SettingsDialog(ctk.CTkToplevel):
                       command=self.destroy).pack(side="left", padx=4)
 
     def _show_about(self) -> None:
-        """关于窗口：软件名、版本、功能亮点、本机运行信息与技术信息（2026-09-10 修订至 V1.8.0）"""
+        """关于窗口：软件名、版本、本机运行信息、功能亮点与各版本修订（2026-09-12 完善至 V1.9.0）。
+
+        2026-09-12：修订说明随版本累积变长，内容区改为"可滚动 + 高度不超过屏幕 68%"，
+        避免在 1366×768 等小屏上"关闭"按钮被挤出屏幕。
+        """
         win = ctk.CTkToplevel(self)
         win.title("关于 PromptSprite")
         win.resizable(False, False)
@@ -161,22 +165,31 @@ class SettingsDialog(ctk.CTkToplevel):
                      f"{_st.get('entries', 0)} 条提示词（动态统计）\n")
         info = (
             f"{config.APP_NAME} · 提示精灵\n"
-            f"版本 V{config.APP_VERSION}（2026-09-10 界面修订版）\n"
+            f"版本 V{config.APP_VERSION}（2026-09-12 界面修订版）\n"
             "──────────────────────────\n"
-            "本地优先的 AI 提示词管理工具：\n"
-            "· 五级分类书架（项目类别/根目录/分类/子分类/条目）\n"
+            "本地优先的 AI 提示词管理工具：数据 100% 存在本机，无任何联网行为。\n"
+            "· 五级分类书架（项目类别 / 根目录 / 一级分类 / 二级分类 / 条目）\n"
             f"{data_line}"
-            "· 打包版内置精简模板（示例提示词，以实际打包库为准）\n"
-            "· 条目多位置：关联到 / 复制到（独立副本）/ 移动到（可整体转移）\n"
+            "· 条目多位置：关联到（一处编辑各处同步）/ 复制到（独立副本）/ 移动到（可整体转移）\n"
             "· 条目就地新增醒目入口；任一分级分类可持有并显示本级条目\n"
             "· 详情区多位置提示；删除分类三级保护（级联删除需输入确认短语）\n"
-            "· 老版本数据自动/引导迁移（未明确分类兜底）\n"
-            "· 每日变更包（按电脑代号区分，可换机合并导入）\n"
-            "· 变更包文件名含 add/del 计数；纯删除（负增量）包有醒目标识\n"
-            "· 导入向导：新增/删除分两维选择——忽略删除/应用删除/逆向恢复（携带快照时）；\n"
-            "   导入前自动快照、删除先进回收站可恢复、可选携带被删快照以支持逆向找回\n"
-            "· 一键复制 / 新建 / 全局热键 Ctrl+Shift+P 唤起\n"
-            "· V1.8.0 界面修订：\n"
+            "· 每日变更包（按电脑代号区分，可换机合并导入）；纯删除包有醒目标识、可逆向恢复\n"
+            "· 导入向导：新增 / 删除分两维选择（忽略删除 / 应用删除 / 逆向恢复），导入前自动快照\n"
+            "· 一键复制 / 新建 / 全局热键 Ctrl+Shift+P 唤起；自动全量备份（按天去重、默认保留 30 份）\n"
+            "· JSON / Excel / Markdown / HTML 多格式导入导出；可与备份库数据比对\n"
+            "· 老版本数据自动 / 引导迁移（未明确分类兜底）\n"
+            "──────────────────────────\n"
+            "V1.9.0 界面修订（2026-09-12）：\n"
+            "   - 详情区字段浮动提示窗口重构：修复“光标与提示窗重叠时闪烁”；提示窗固定在\n"
+            "     详情区左侧、不遮盖正文；隐藏四级目录后自动压窄\n"
+            "   - 提示窗增强：内容可滚动（滚动条 / 滚轮）、随文本框同步滚动、光标所在行加深、\n"
+            "     字号 14pt、高度最少 18 行 / 最多 30 行\n"
+            "   - 新增“💬 打开/关闭浮动提示窗口”总开关：一键关闭“条目名称一览”与\n"
+            "     “详情区字段提示”两类浮动提示（按钮 / 导航长名称提示不受影响）\n"
+            "   - “🗂”按钮新增浮动提示“打开/关闭四级目录”，并支持两态配色：\n"
+            "     目录打开＝绿色、目录关闭＝黄色\n"
+            "   - “条目名称一览”浮层文字字号与条目名称一致，最小高度 25 行\n"
+            "V1.8.0 界面修订（2026-09-10）：\n"
             "   - 工具栏重排：锁定 · 目录隐藏/显示 · 无类条目 · 常用 · 新建 · 导入 · 导出 · 设置 · 搜索(🔍)\n"
             "   - 🗂 目录隐藏/目录显示：可任选隐藏各分类列（含“全部隐藏/全部显示”），\n"
             "     底部小图标 🗂 一键全隐/全显；窗口最小宽度随之动态调整\n"
@@ -184,9 +197,7 @@ class SettingsDialog(ctk.CTkToplevel):
             "   - 搜索防抖：输入停顿约 1.5 秒后才查询（点 🔍 或回车可立即搜索）\n"
             "   - 条目列悬停“条目名称一览”浮层：可移入浮层滚动，滚轮与条目区同步\n"
             "   - 详情区 ②~⑦ 整组默认折叠为 1 行；命令条与底部栏按钮重排、宽度贴合文字\n"
-            "· JSON / Excel / Markdown / HTML 多格式导入导出；可与备份库数据比对\n"
-            "· 自动全量备份（按天去重，默认保留最近 30 份，可设；手动快照不清理）\n"
-            "· 数据 100% 本机存储，无任何联网行为\n"
+            "· 打包版内置精简模板（示例提示词，以实际打包库为准）\n"
             "──────────────────────────\n"
             f"{run_desc}\n"
             f"{path_desc}\n"
@@ -199,13 +210,42 @@ class SettingsDialog(ctk.CTkToplevel):
             "（MIT License，欢迎 Star / Issue）\n"
             "© 2026 PromptSprite 开发组 · 仅供学习与个人使用"
         )
-        ctk.CTkLabel(win, text=info, font=("Microsoft YaHei", 13),
-                     justify="left").pack(padx=24, pady=(20, 8))
+        # 2026-09-12（V1.9.0）：内容区改为"只读文本框 + 原生滚动"，高度取"内容所需"与
+        # "屏幕 68%"的较小值，确保小屏（如 1366×768）上"关闭"按钮也不会被挤出屏幕。
+        try:
+            import tkinter.font as tkfont
+            _f = tkfont.Font(root=win, font=("Microsoft YaHei", 13))
+            _line_h = _f.metrics("linespace") or 22
+            _need_h = (info.count("\n") + 1) * _line_h + 20
+            _max_w = max((_f.measure(_ln) for _ln in info.split("\n")), default=420)
+        except Exception:
+            _need_h, _max_w = 560, 620
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        box = ctk.CTkTextbox(win, width=200, height=200, wrap="word",
+                             fg_color="transparent", border_width=0,
+                             font=("Microsoft YaHei", 13))
+        # CTk 会按系统 DPI 缩放控件尺寸，故按控件实际缩放把"像素目标"换算成控件单位，
+        # 否则高 DPI 下高度会被放大、仍可能超出屏幕。
+        try:
+            scale = float(box._get_widget_scaling()) or 1.0
+        except Exception:
+            scale = 1.0
+        want_w = min(_max_w + 70, int(sw * 0.92), 780)
+        want_h = max(min(_need_h, int(sh * 0.68)), 200)
+        box.configure(width=want_w / scale, height=want_h / scale)
+        box.pack(padx=10, pady=(12, 2))
+        box.insert("1.0", info)
+        box.configure(state="disabled")
         ctk.CTkButton(win, text="关闭", width=88,
-                      command=win.destroy).pack(pady=(4, 16))
+                      command=win.destroy).pack(pady=(6, 14))
         win.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() - win.winfo_width()) // 2
-        y = self.winfo_y() + (self.winfo_height() - win.winfo_height()) // 2
+        ww, wh = win.winfo_reqwidth(), win.winfo_reqheight()
+        # 2026-09-12（用户要求）：初始位置改为"窗口上边距屏幕顶端 100 像素"（原为按父窗口垂直居中）；
+        # 横向仍在父窗口（设置窗口）内居中；极端小屏时兜底不越出屏幕下边。
+        x = self.winfo_x() + (self.winfo_width() - ww) // 2
+        y = 100
+        if y + wh > sh - 8:
+            y = max(sh - wh - 8, 0)
         win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
         win.lift()
 
@@ -242,8 +282,16 @@ class SettingsDialog(ctk.CTkToplevel):
         self.destroy()
 
     def _center(self) -> None:
+        """设置窗口初始位置（2026-09-12 用户要求）。
+
+        横向仍在父窗口（主窗口）内居中；**窗口上边固定距屏幕顶端 100 像素**（原为按父窗口
+        垂直居中）；并兜底不越出屏幕下边。
+        """
         self.update_idletasks()
         x = self.master.winfo_x() + (self.master.winfo_width() - self.winfo_width()) // 2
-        y = self.master.winfo_y() + (self.master.winfo_height() - self.winfo_height()) // 2
+        y = 100
+        sh = self.winfo_screenheight()
+        if y + self.winfo_height() > sh - 8:
+            y = max(sh - self.winfo_height() - 8, 0)
         self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
         self.lift()

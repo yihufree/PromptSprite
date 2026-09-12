@@ -141,6 +141,32 @@ _ENTRY_OV_BG = "#ffffff"       # 默认底色
 _ENTRY_OV_FG = "#111111"       # 默认文字色
 _ENTRY_OV_HL_BG = "#25639c"    # 高亮底色（与浮层标题栏同色）
 _ENTRY_OV_HL_FG = "#ffffff"    # 高亮文字色
+# 2026-09-12（用户要求 1）：条目区"条目名称"字体——悬停浮层"条目名称一览"内文字字号与之保持一致
+_ENTRY_NAME_FONT_CARD = ("Microsoft YaHei", 13, "bold")   # 卡片视图（默认）条目名称
+_ENTRY_NAME_FONT_LIST = ("Microsoft YaHei", 12, "bold")   # 列表视图条目名称
+_ENTRY_OV_MIN_ROWS = 25        # 2026-09-12（用户要求）：悬停浮层固定最小高度＝可显示 25 行文本
+_ENTRY_OV_MAX_ROWS = 25        # 上限与最小一致 → 浮层恒为 25 行高（条目更多时用右侧滚动条）
+# 2026-09-12（用户要求 3）：详情区左下"🗂 打开/关闭四级目录"按钮两态配色
+_DIR_OPEN_BG = "#2E8B57"       # 目录打开（四列显示）→ 绿色
+_DIR_OPEN_HOVER = "#256e46"
+_DIR_CLOSED_BG = "#E0A800"     # 目录关闭（四列隐藏）→ 黄色
+_DIR_CLOSED_HOVER = "#B98A00"
+
+# 2026-09-12（用户要求 2）：详情区"字段内容"浮动提示窗口。
+# 定位：整体在详情区【左侧】、右边紧贴详情区左边界并向左展开；顶部与被悬停字段顶部对齐。
+# 宽度：取详情区左侧可用空间，上限 _TIP_MAX_W —— 因此点"🗂 目录隐藏"隐藏四级目录、
+#       详情区变宽后，浮窗会自动压窄（左侧只剩条目列），始终不遮盖详情区正文。
+_TIP_MAX_W = 610         # 浮窗最大宽度（详情区左侧空间充足时使用；2026-09-12 追加要求：由 560 再 +50）
+_TIP_MIN_LINES = 18      # 浮窗内容区固定最小显示行数（2026-09-12 追加要求：保证最少可见 18 行）
+_TIP_MAX_LINES = 30      # 浮窗内容区最多显示行数（超出用右侧滚动条；文本多时由本上限封顶）
+_TIP_MARGIN = 8          # 浮窗与屏幕/左侧边界的安全间距
+_TIP_GAP = 4             # 浮窗右边与详情区左边界之间的间隙
+_TIP_SHOW_MS = 350       # 悬停多久后弹出
+_TIP_HIDE_MS = 250       # 离开字段后延时多久判断是否关闭（给"移向浮窗"留出行程）
+_TIP_POLL_MS = 150       # 光标仍在浮窗/阅读区内时的轮询间隔
+_TIP_HL_BG = "#cfe2f5"   # 光标所在行加深底色
+_TIP_HL_FG = "#0b3b66"   # 光标所在行加深文字色
+_TIP_FONT = ("Microsoft YaHei", 14, "normal")   # 浮窗文字字号：固定 14pt（2026-09-12 用户要求）
 
 
 class _FieldTooltip:
@@ -248,6 +274,14 @@ class MainWindow(ctk.CTk):
         self._entry_ov_cur = None       # 光标当前所在条目 id
         self._entry_ov_hl = None        # 浮层内上一次高亮的行号（恢复默认配色用）
         self._search_after = None       # 2026-09-10（用户要求）：搜索输入防抖定时器 id
+        # 2026-09-12（用户要求 1~3）：详情区字段浮动提示 + "打开/关闭浮动提示窗口"总开关
+        self._float_tips_on = True      # 总开关（作用：条目名称一览 + 详情区字段浮动提示）
+        self._tip_popup = None          # 详情区字段浮动提示窗口（Toplevel）
+        self._tip_text = None           # 浮窗内只读文本控件（tk.Text，同步滚动/加深用）
+        self._tip_src = None            # 触发提示的源文本框内部 Text（tk.Text）
+        self._tip_trigger = None        # 触发提示的控件（文本框，判断光标是否仍在阅读区）
+        self._tip_after = None          # 延时弹出/延时关闭定时器 id
+        self._tip_hl = None             # 浮窗内上一次加深的行号
 
         self._load_settings()   # 2026-08-18：应用持久化设置（窗口大小/视图模式/详情策略）
         self._build_toolbar()
@@ -551,9 +585,20 @@ class MainWindow(ctk.CTk):
         # 一键"全部隐藏/全部显示"各分类区域（与工具栏"目录隐藏/目录显示"按钮等价，见 _toggle_all_dirs）。
         self.dir_toggle_btn = ctk.CTkButton(
             self.detail_foot, text="🗂", width=32, height=32,
-            fg_color="#6b7280", hover_color="#575e68", font=("Microsoft YaHei", 15),
+            fg_color=_DIR_OPEN_BG, hover_color=_DIR_OPEN_HOVER, font=("Microsoft YaHei", 15),
             command=self._toggle_all_dirs)
         self.dir_toggle_btn.pack(side="left", padx=(8, 0), pady=4)
+        self._apply_dir_toggle_style()   # 2026-09-12（用户要求 3）：按目录显隐刷绿色/黄色
+        # 2026-09-12（用户要求 3）："🗂"右侧新增"打开/关闭浮动提示窗口"快捷按钮（无文字标签）。
+        # 开启=蓝色、关闭=灰色；作用于"条目名称一览"浮层与"详情区字段内容"浮动提示两处。
+        self.tip_toggle_btn = ctk.CTkButton(
+            self.detail_foot, text="💬", width=32, height=32,
+            fg_color="#2f6fb0", hover_color="#255a92", font=("Microsoft YaHei", 15),
+            command=self._toggle_float_tips)
+        self.tip_toggle_btn.pack(side="left", padx=(6, 0), pady=4)
+        # 2026-09-12（用户要求 3/4）：两个快捷按钮的浮动提示文字
+        _FieldTooltip(self.tip_toggle_btn, "打开/关闭浮动提示窗口")
+        _FieldTooltip(self.dir_toggle_btn, "打开/关闭四级目录")
         self.recycle_btn = ctk.CTkButton(
             self.detail_foot, text="♻ 删除历史 / 回收站", width=139, height=32,
             fg_color="#6b7280", hover_color="#575e68",
@@ -944,9 +989,24 @@ class MainWindow(ctk.CTk):
                 frame.grid(row=0, column=idx, sticky="nsew")         # 显示：恢复原列位
         self.btn_project_toggle.configure(
             text="🗂 目录显示" if hidden_count > 0 else "🗂 目录隐藏")
+        self._apply_dir_toggle_style()   # 2026-09-12（用户要求 3）：详情区"🗂"按钮绿/黄两态
         # 2026-09-10（用户要求 3）：按被隐藏的列宽同步降低窗口最小宽度，
         # 使用户可把窗口（连同右侧详情区）缩得更窄；恢复显示时自动还原。
         self.minsize(self._nav_min_width(), _BASE_MIN_HEIGHT)
+
+    def _apply_dir_toggle_style(self) -> None:
+        """按"四级目录是否显示"刷新详情区左下"🗂"按钮配色（2026-09-12，用户要求 3）。
+
+        目录打开（四列显示，_nav_hidden == 0）＝绿色；目录关闭（四列隐藏）＝黄色。
+        与工具栏"目录隐藏/目录显示"共用 apply_nav_visibility 这一唯一入口，故两处始终同步。
+        """
+        opened = self._nav_hidden == 0
+        try:
+            self.dir_toggle_btn.configure(
+                fg_color=(_DIR_OPEN_BG if opened else _DIR_CLOSED_BG),
+                hover_color=(_DIR_OPEN_HOVER if opened else _DIR_CLOSED_HOVER))
+        except Exception:
+            pass
 
     def _toggle_all_dirs(self) -> None:
         """详情区底部"🗂"小图标快捷按钮：一键全部隐藏 / 全部显示各分类列（2026-09-10，用户要求 二）。
@@ -957,6 +1017,28 @@ class MainWindow(ctk.CTk):
             self.apply_nav_visibility(0)                       # 有隐藏（含部分隐藏）→ 全部显示
         else:
             self.apply_nav_visibility(len(self._nav_cols))     # 四列全显示 → 全部隐藏
+
+    def _toggle_float_tips(self) -> None:
+        """打开/关闭浮动提示窗口（2026-09-12，用户要求 3）。
+
+        作用于"条目名称一览"浮层与"详情区字段内容"浮动提示两处；关闭时立即收起已显示的浮层。
+        不影响按钮/导航长名称提示（用户 2026-09-12 确认：只关这两类）。
+        """
+        self._float_tips_on = not self._float_tips_on
+        if not self._float_tips_on:
+            self._hide_entry_overview()
+            self._hide_field_tip()
+        self._apply_tip_toggle_style()
+
+    def _apply_tip_toggle_style(self) -> None:
+        """按总开关状态刷新"💬"按钮配色（开=蓝、关=灰）（2026-09-12，用户要求 3）。"""
+        on = self._float_tips_on
+        try:
+            self.tip_toggle_btn.configure(
+                fg_color=("#2f6fb0" if on else "#9aa4b1"),
+                hover_color=("#255a92" if on else "#7c8591"))
+        except Exception:
+            pass
 
     def _project_menu(self, event, project_id: Optional[int], name: str) -> None:
         lock_state = "disabled" if self._lock_on else "normal"
@@ -1415,7 +1497,7 @@ class MainWindow(ctk.CTk):
         top.pack(fill="x", padx=8, pady=(6, 0))
         star = "★ " if e["is_favorite"] else ""
         ctk.CTkLabel(top, text=f"{star}{e['name']}",
-                     font=("Microsoft YaHei", 13, "bold"), anchor="w").pack(side="left")
+                     font=_ENTRY_NAME_FONT_CARD, anchor="w").pack(side="left")
         summary = (e["intro"] or "").strip() or "（无介绍）"
         ctk.CTkLabel(card, text=summary, wraplength=330, justify="left",
                      text_color="gray", anchor="w").pack(fill="x", padx=8, pady=(2, 6))
@@ -1425,7 +1507,7 @@ class MainWindow(ctk.CTk):
         row = ctk.CTkFrame(self.entry_frame, corner_radius=6)
         row.pack(fill="x", padx=6, pady=1)
         star = "★ " if e["is_favorite"] else ""
-        ctk.CTkLabel(row, text=f"{star}{e['name']}", font=("Microsoft YaHei", 12, "bold"),
+        ctk.CTkLabel(row, text=f"{star}{e['name']}", font=_ENTRY_NAME_FONT_LIST,
                      anchor="w").pack(side="left", padx=8, pady=4)
         summary = ((e["intro"] or "").replace("\n", " ")[:36]) or "（无介绍）"
         ctk.CTkLabel(row, text=summary, text_color="gray", anchor="e",
@@ -1472,7 +1554,11 @@ class MainWindow(ctk.CTk):
             self._entry_ov_after = None
 
     def _entry_ov_enter(self, _event=None) -> None:
-        if not self._entry_ov_names:
+        # 2026-09-12（用户要求 3）：总开关关闭时不弹"条目名称一览"
+        if not self._float_tips_on or not self._entry_ov_names:
+            return
+        # 2026-09-12（用户要求 2）：详情区字段浮窗打开时不叠加"条目名称一览"
+        if self._tip_popup is not None:
             return
         if _event is not None and getattr(_event, "y_root", None):
             self._entry_ov_y = _event.y_root
@@ -1596,9 +1682,12 @@ class MainWindow(ctk.CTk):
         popup = tk.Toplevel(self.entry_frame)
         popup.wm_overrideredirect(True)
         popup.configure(bg="#ffffff")
+        # 2026-09-12（用户要求 1）：浮层内文字字号＝条目区"条目名称"字号（随当前视图模式）
+        name_font = (_ENTRY_NAME_FONT_CARD if self._view_mode == "card"
+                     else _ENTRY_NAME_FONT_LIST)
         head = tk.Label(popup, text=f"📋 条目名称一览（共 {len(names)} 条）",
                         bg="#25639c", fg="white", padx=8, pady=4,
-                        font=("Microsoft YaHei", 10, "bold"))
+                        font=name_font)
         head.pack(fill="x")
         body = tk.Frame(popup, bg="#ffffff")
         body.pack(fill="both", expand=True)
@@ -1606,8 +1695,10 @@ class MainWindow(ctk.CTk):
         sb.pack(side="right", fill="y")
         max_len = max((len(n) for n in names), default=4)
         width = max(min(max_len + 4, 60), 24)
-        lb = tk.Listbox(body, font=("Microsoft YaHei", 10), activestyle="none",
-                        width=width, height=min(len(names), 16),
+        # 2026-09-12（用户要求）：最小高度固定为可显示 25 行文本（恒为 25 行高，条目更多时滚动）
+        rows = min(max(len(names), _ENTRY_OV_MIN_ROWS), _ENTRY_OV_MAX_ROWS)
+        lb = tk.Listbox(body, font=name_font, activestyle="none",
+                        width=width, height=rows,
                         bg=_ENTRY_OV_BG, fg=_ENTRY_OV_FG,   # 2026-09-11 09:27（用户要求 3）：显式配色
                         yscrollcommand=sb.set, borderwidth=0, highlightthickness=0)
         for i, n in enumerate(names, 1):
@@ -1641,6 +1732,264 @@ class MainWindow(ctk.CTk):
         self._entry_ov_hl = None      # 2026-09-11 09:27（用户要求 3）：新浮层无旧高亮行
         self._highlight_entry_overview()   # 2026-09-11 09:27（用户要求 3）：立即高亮光标所在条目
 
+    # ------------------------------------------------------------------ #
+    # 详情区字段浮动提示（2026-09-12，用户要求 1~2）
+    #   1) 位置固定：整体在详情区【左侧】、右边紧贴详情区左边界并向左展开；顶部与被悬停字段对齐，
+    #      不再出现"左/上/下"三种位置；宽度取左侧可用空间，隐藏目录后自动压窄、绝不遮盖正文。
+    #   2) 交互：延时弹出；光标移入浮窗不消失（只有离开文本区且未移向浮窗才关闭）；
+    #      浮窗内可滚动（滚轮 / 滚动条拖动）；源文本框滚动时浮窗同步滚动；光标所在行在浮窗内加深。
+    # ------------------------------------------------------------------ #
+    def _attach_field_tip(self, widget, text: str, src_text, title: str) -> None:
+        """为详情区字段文本框挂接浮动提示（2026-09-12，用户要求 2）。
+
+        解决原 _FieldTooltip 的闪烁：原实现"悬停即建窗、离开即销毁"，提示窗紧贴控件边缘，
+        光标一旦落到提示窗上就触发 Leave→销毁→再 Enter→重建的死循环。此处改为"延时弹出 +
+        延时判断光标位置"，并额外绑定源文本框的 Motion 以支持同步滚动/逐行加深。
+        """
+        widget.bind("<Enter>",
+                    lambda _e, w=widget, t=text, s=src_text, ti=title:
+                    self._field_tip_enter(w, t, s, ti), add="+")
+        widget.bind("<Leave>", lambda _e, w=widget: self._field_tip_leave(w), add="+")
+        # 光标在源文本框内移动 → 浮窗内同一行加深（同一源文本框只绑定一次 Motion）
+        if src_text is not None and not getattr(src_text, "_ps_tip_motion_ok", False):
+            try:
+                src_text._ps_tip_motion_ok = True
+                src_text.bind("<Motion>",
+                              lambda e, s=src_text: self._field_tip_track(s, e), add="+")
+            except Exception:
+                pass
+
+    def _cancel_field_tip(self) -> None:
+        """取消挂起的"延时弹出/延时关闭"定时器（2026-09-12）。"""
+        if self._tip_after is not None:
+            try:
+                self.after_cancel(self._tip_after)
+            except Exception:
+                pass
+            self._tip_after = None
+
+    def _field_tip_enter(self, widget, text: str, src_text, title: str) -> None:
+        """悬停字段：延时弹出完整内容（2026-09-12，用户要求 2）。"""
+        if not self._float_tips_on or self._tip_popup is not None:
+            return
+        self._cancel_field_tip()
+        self._tip_after = self.after(
+            _TIP_SHOW_MS, lambda: self._show_field_tip(widget, text, src_text, title))
+
+    def _field_tip_leave(self, widget=None) -> None:
+        """离开字段：延时判断光标是否移入浮窗（2026-09-12，用户要求 2-(3)）。
+
+        widget 非空时先判断光标是否仍在触发控件矩形内——Tk 在"父/子控件"之间切换会补发
+        成对 Enter/Leave，若不忽略会把刚排好的"延时弹出"误取消，导致浮窗不出现。
+        """
+        if widget is not None and self._pointer_in_widget(widget):
+            return
+        self._cancel_field_tip()
+        self._tip_after = self.after(_TIP_HIDE_MS, self._field_tip_maybe_hide)
+
+    def _field_tip_maybe_hide(self) -> None:
+        """延时判断是否关闭浮窗；光标仍在浮窗/阅读区内则保持并轮询（用户要求 2-(3)）。"""
+        self._cancel_field_tip()
+        if self._tip_popup is None:
+            return
+        if self._pointer_in_tip_area():
+            self._tip_after = self.after(_TIP_POLL_MS, self._field_tip_maybe_hide)
+            return
+        self._hide_field_tip()
+
+    @staticmethod
+    def _pointer_in_widget(widget) -> bool:
+        """光标当前是否位于指定控件的屏幕矩形内（2026-09-12）。"""
+        try:
+            if widget is None or not widget.winfo_exists() or not widget.winfo_ismapped():
+                return False
+            px, py = widget.winfo_pointerxy()
+            x, y = widget.winfo_rootx(), widget.winfo_rooty()
+            return (x <= px <= x + widget.winfo_width()
+                    and y <= py <= y + widget.winfo_height())
+        except Exception:
+            return False
+
+    def _pointer_in_tip_area(self) -> bool:
+        """光标是否仍在"浮窗 + 触发控件 + 源文本框"范围内（2026-09-12，用户要求 2-(3)）。"""
+        for w in (self._tip_popup, self._tip_trigger, self._tip_src):
+            if w is not None and self._pointer_in_widget(w):
+                return True
+        return False
+
+    def _hide_field_tip(self) -> None:
+        """立即关闭详情区字段浮动提示并清理状态（2026-09-12）。"""
+        self._cancel_field_tip()
+        if self._tip_popup is not None:
+            try:
+                self._tip_popup.destroy()
+            except Exception:
+                pass
+        self._tip_popup = None
+        self._tip_text = None
+        self._tip_src = None
+        self._tip_trigger = None
+        self._tip_hl = None
+
+    def _show_field_tip(self, widget, text: str, src_text, title: str) -> None:
+        """构建并显示详情区字段浮动提示（2026-09-12，用户要求 1~2）。
+
+        位置：右边贴详情区左边界、向左展开（顶部与被悬停字段顶部对齐）；宽度＝详情区左侧
+        可用空间（上限 _TIP_MAX_W），故隐藏四级目录后自动压窄，始终不遮盖详情区正文；
+        内容超出 _TIP_MAX_LINES 行时用右侧滚动条。
+        """
+        self._cancel_field_tip()
+        if not self._float_tips_on or self._tip_popup is not None:
+            return
+        try:
+            if not widget.winfo_exists():
+                return
+            popup = tk.Toplevel(widget)
+        except Exception:
+            return
+        popup.wm_overrideredirect(True)
+        popup.configure(bg="#ffffff")
+        head = tk.Label(popup, text=f"📄 {title} · 完整内容",
+                        bg="#25639c", fg="white", padx=8, pady=4, anchor="w",
+                        font=("Microsoft YaHei", 10, "bold"))
+        head.pack(fill="x")
+        bd = tk.Frame(popup, bg="#ffffff")
+        bd.pack(fill="both", expand=True)
+        sb = tk.Scrollbar(bd)
+        sb.pack(side="right", fill="y")
+        # 2026-09-12（用户要求 1）：字号固定 14pt；高度固定最小值 18 行，内容多时按行增加
+        tip_font = _TIP_FONT
+        try:
+            import tkinter.font as tkfont
+            line_px = tkfont.Font(root=popup, font=tip_font).metrics("linespace") or 20
+        except Exception:
+            line_px = 22
+        sh = popup.winfo_screenheight()
+        fit_lines = max(6, (sh - 100) // max(line_px, 1))   # 小屏保护：不超过屏幕可容纳行数
+        lines = (text or "").count("\n") + 1
+        show_lines = min(max(lines, _TIP_MIN_LINES), _TIP_MAX_LINES, fit_lines)
+        tip = tk.Text(bd, font=tip_font, wrap="word", height=show_lines,
+                      bg="#ffffff", fg="#111111", relief="flat", borderwidth=0,
+                      highlightthickness=0, padx=8, pady=6,
+                      yscrollcommand=sb.set, cursor="arrow")
+        tip.insert("1.0", text or "")
+        tip.tag_configure("curline", background=_TIP_HL_BG, foreground=_TIP_HL_FG)
+        tip.configure(state="disabled")
+        tip.pack(side="left", fill="both", expand=True)
+        sb.configure(command=tip.yview)
+        # 浮窗内：进入→取消关闭；离开→延时判断；滚轮→直接滚动浮窗内容（用户要求 2-(4)/(3)）
+        for wdg in (popup, head, bd, tip, sb):
+            wdg.bind("<Enter>", lambda _e: self._cancel_field_tip(), add="+")
+            wdg.bind("<Leave>", lambda _e: self._field_tip_leave(None), add="+")
+        popup.bind("<MouseWheel>", lambda e, t=tip: self._tip_wheel(e, t))
+        tip.bind("<MouseWheel>", lambda e, t=tip: self._tip_wheel(e, t))
+        # 位置：右边紧贴详情区左边界，向左展开；宽度＝左侧可用空间（隐藏目录后自动压窄）
+        popup.update_idletasks()
+        h = popup.winfo_reqheight()
+        try:
+            right = self.detail_root.winfo_rootx() - _TIP_GAP
+        except Exception:
+            right = widget.winfo_rootx() - _TIP_GAP
+        w = max(min(right - _TIP_MARGIN, _TIP_MAX_W), 120)
+        x = max(right - w, _TIP_MARGIN)
+        y = widget.winfo_rooty()          # 顶部与被悬停字段顶部对齐（便于逐行对照）
+        if y + h > sh - _TIP_MARGIN:
+            y = max(sh - h - _TIP_MARGIN, _TIP_MARGIN)
+        if y < _TIP_MARGIN:
+            y = _TIP_MARGIN
+        popup.wm_geometry(f"{w}x{h}+{x}+{y}")
+        self._tip_popup = popup
+        self._tip_text = tip
+        self._tip_src = src_text
+        self._tip_trigger = widget
+        self._tip_hl = None
+        self._sync_field_tip(src_text)              # 初始位置与源文本框一致（用户要求 2-(5)）
+        self._field_tip_initial_highlight(src_text)  # 初始加深光标所在行（用户要求 2-(5)）
+
+    @staticmethod
+    def _tip_wheel(event, tip) -> str:
+        """浮窗内滚轮滚动浮窗内容；返回 "break" 阻止联动详情区滚动（用户要求 2-(4)）。"""
+        try:
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta and tip.winfo_exists():
+                steps = -int(delta / 120)
+                tip.yview_scroll(steps if steps else (-1 if delta > 0 else 1), "units")
+        except Exception:
+            pass
+        return "break"
+
+    @staticmethod
+    def _count_display_lines(tip, index1, index2) -> int:
+        """统计 tk.Text 两字符位置之间的"显示行数"（自动换行后的实际行数）（2026-09-12）。"""
+        try:
+            n = tip.count(index1, index2, "displaylines")
+            if isinstance(n, (tuple, list)):
+                n = n[0] if n else 0
+            return int(n or 0)
+        except Exception:
+            return 0
+
+    def _sync_field_tip(self, src=None) -> None:
+        """源文本框滚动 → 浮窗按同一位置同步滚动（2026-09-12，用户要求 2-(5)）。
+
+        浮窗内是与源文本框逐字符相同的文本，故取"源文本框可视区首字符"在浮窗内的显示行，
+        换算为滚动比例后 moveto——与两窗宽度是否相同无关，隐藏目录变宽后依然准确。
+        """
+        src = src if src is not None else self._tip_src
+        tip = self._tip_text
+        if src is None or tip is None:
+            return
+        try:
+            if not src.winfo_exists() or not tip.winfo_exists():
+                return
+            top = src.index("@0,0")          # 源文本框可视区左上角字符
+            cur = self._count_display_lines(tip, "1.0", top)
+            total = self._count_display_lines(tip, "1.0", "end")
+            if total > 0:
+                tip.yview_moveto(max(0.0, min(1.0, cur / total)))
+        except Exception:
+            pass
+
+    def _field_tip_track(self, src_text, event) -> None:
+        """光标在源文本框内移动 → 浮窗内同一行加深（2026-09-12，用户要求 2-(5)）。"""
+        if self._tip_popup is None or src_text is not self._tip_src:
+            return
+        try:
+            line = int(src_text.index(f"@{event.x},{event.y}").split(".")[0])
+        except Exception:
+            return
+        self._highlight_field_tip_line(line)
+
+    def _field_tip_initial_highlight(self, src_text) -> None:
+        """浮窗弹出时先按当前光标位置加深一行（2026-09-12，用户要求 2-(5)）。"""
+        if src_text is None or not self._pointer_in_widget(src_text):
+            return
+        try:
+            px, py = src_text.winfo_pointerxy()
+            line = int(src_text.index(
+                f"@{px - src_text.winfo_rootx()},{py - src_text.winfo_rooty()}"
+            ).split(".")[0])
+            self._highlight_field_tip_line(line)
+        except Exception:
+            pass
+
+    def _highlight_field_tip_line(self, line: int) -> None:
+        """把浮窗内指定行加深（2026-09-12，用户要求 2-(5)）。"""
+        tip = self._tip_text
+        if tip is None:
+            return
+        try:
+            if not tip.winfo_exists():
+                return
+            tip.configure(state="normal")   # 只读态下 tag 操作保险起见先临时放行
+            if self._tip_hl is not None and self._tip_hl != line:
+                tip.tag_remove("curline", "1.0", "end")
+            tip.tag_add("curline", f"{line}.0", f"{line}.end")
+            tip.configure(state="disabled")
+            self._tip_hl = line
+        except Exception:
+            pass
+
     def _select_entry(self, entry_id: int) -> None:
         if not self._confirm_unsaved():
             return
@@ -1663,6 +2012,7 @@ class MainWindow(ctk.CTk):
         self._add_target = None
         self._add_group_open = False
         self._add_group_pairs = []
+        self._hide_field_tip()   # 2026-09-12（用户要求 2）：详情重建前先收起字段浮动提示（避免引用已销毁控件）
         self._clear_frame(self.detail_scroll)
         self._detail_boxes = {}
         self._detail_dirty = False
@@ -1772,8 +2122,8 @@ class MainWindow(ctk.CTk):
             box.bind("<KeyRelease>", self._mark_dirty)
             self._detail_boxes[key] = box
             full = e[key] or "（无内容）"
-            _FieldTooltip(lbl, full)
-            _FieldTooltip(box, full)
+            # 2026-09-12（用户要求 2）：改用新的浮动提示（左移不遮正文、可滚动、同步滚动、光标行加深）
+            self._attach_field_tip(box, full, box._textbox, label)
 
         # ②~⑦ 折叠组展开时把卡片插回标题条与这个锚点（第一个 ⑧⑨⑩ 字段块）之间
         if group_trailing is not None:
@@ -1828,19 +2178,28 @@ class MainWindow(ctk.CTk):
                        add="+")
 
     def _detail_wheel_route(self, event, text_widget, canvas):
-        """详情区文本框滚轮分流（2026-09-11，用户要求 4）。
+        """详情区文本框滚轮分流（2026-09-11，用户要求 4；2026-09-12 增加浮窗同步）。
 
         激活判定：该文本框是否拥有键盘焦点——点击文本区即会获得焦点，仅悬停/滑过不会，
         因此"必须先在区域内点击，滚轮才作用于该文本框"。
         - 未激活：与既有行为一致，滚轮整体转给详情区滚动。
         - 已激活：先滚动文本框自身（约 20px/格，与详情区步进一致）；若已到上/下端
           （或内容无溢出、无处可滚），再把该次滚轮转给详情区。
+        - 2026-09-12（用户要求 2-(5)）：详情区字段浮窗打开且滚轮落在其源文本框上时，
+          始终滚动该文本框并同步浮窗（不再转给详情区页面，避免源文本框被滚出视野）。
         始终返回 "break"：阻止 tk.Text 类级绑定与 CTkScrollableFrame 的 bind_all
         处理，避免"文本框与详情区同时滚动"。
         """
+        delta = int(getattr(event, "delta", 0) or 0)
+        if delta and self._tip_popup is not None and text_widget is self._tip_src:
+            try:
+                text_widget.yview_scroll(-int(delta / 6), "pixels")
+            except Exception:
+                pass
+            self._sync_field_tip(text_widget)   # 浮窗内容随源文本框同步滚动
+            return "break"
         try:
             if text_widget.focus_get() is text_widget:
-                delta = int(getattr(event, "delta", 0) or 0)
                 if delta:
                     before = text_widget.yview()
                     text_widget.yview_scroll(-int(delta / 6), "pixels")
@@ -1908,8 +2267,8 @@ class MainWindow(ctk.CTk):
             box.bind("<KeyRelease>", self._mark_dirty)
             self._detail_boxes[key] = box
             full = e[key] or "（无内容）"
-            _FieldTooltip(lbl, full)
-            _FieldTooltip(box, full)
+            # 2026-09-12（用户要求 2）：改用新的浮动提示（左移不遮正文、可滚动、同步滚动、光标行加深）
+            self._attach_field_tip(box, full, box._textbox, label)
             widgets.append(blk)
             if key == "image_desc":  # ⑦ 下方紧跟图片预览区，一并随组显隐
                 widgets.append(self._build_image_area(parent=self.detail_scroll,
@@ -1981,8 +2340,8 @@ class MainWindow(ctk.CTk):
         box.bind("<KeyRelease>", self._mark_dirty)
         self._detail_boxes[key] = box
         full = e[key] or "（无内容）"
-        _FieldTooltip(lbl, full)
-        _FieldTooltip(box, full)
+        # 2026-09-12（用户要求 2）：改用新的浮动提示（左移不遮正文、可滚动、同步滚动、光标行加深）
+        self._attach_field_tip(box, full, box._textbox, label)
 
         if toggle is not None:
             def _toggle():
@@ -2346,6 +2705,7 @@ class MainWindow(ctk.CTk):
         self._add_group_open = False
         self._add_group_pairs = []
         self._add_prompt_toggles = {}  # 2026-09-11（用户要求 1）：重建表单时清空 ⑧/⑨ 展开按钮引用
+        self._hide_field_tip()         # 2026-09-12（用户要求 2）：新增表单重建前先收起字段浮动提示
         self._browse_mode = False  # 新增必须录入 → 强制编辑模式
         try:
             self.edit_mode_toggle.set("✏️ 编辑")
