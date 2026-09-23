@@ -8,7 +8,7 @@ env/
 .pytest_cache/
 
 # ===== 运行时数据（本地数据库、自动备份、关联图片）=====
-data/
+# data/          2026-09-21 修改添加
 # 2026-08-18（第023条）：打包时由 build.py 生成的临时内嵌库（每次打包自动重建）
 app/resources/builtin_prompts.db
 
@@ -25,8 +25,18 @@ build/PromptSprite/   # PyInstaller 中间产物目录（build.py --clean 会重
 
 # ===== 测试残留 =====
 _selftest_out.txt
+# 2026-09-17（用户确认 C-2/C-3）：测试数据副本与历史测试脚本目录**保留在本地但不入库**
+#   · datatest/      —— 含真实数据副本（prompts*.db，约 24MB），不宜入库
+#   · test_file_bak/ —— 历史一次性测试脚本（25 个）
+datatest/
+test_file_bak/
 
 # ===== 系统文件 =====
 Thumbs.db
 .DS_Store
 *.log
+
+
+# ===== 资源包 =====
+Label Examples/
+prompt Examples/

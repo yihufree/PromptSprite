@@ -12,7 +12,7 @@ import os
 from datetime import datetime
 
 from ..config import data_dir
-from .json_io import _gather_categories, _ancestor_chain_cats
+from .json_io import _scope_categories, scope_title
 
 _ENTRY_FIELDS = [
     ("② 介绍", "intro"), ("③ 溯源", "origin"), ("④ 核心特征", "features"),
@@ -81,6 +81,33 @@ def _image_tag(e) -> str:
         return ""
 
 
+def _gallery_img_tag(g) -> str:
+    """图集项 → <img>：本地图 base64 内嵌；外链图直接引用网址（导出后离线打开时外链可能不可用）"""
+    if not isinstance(g, dict):
+        return ""
+    if g.get("kind") == "url":
+        url = (g.get("source_url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            return ""
+        return f'<img src="{html.escape(url)}" alt="图集外链" loading="lazy"/>'
+    p = (g.get("path") or "").strip()
+    if not p:
+        return ""
+    try:
+        root = os.path.abspath(data_dir())
+        full = os.path.abspath(os.path.join(root, p))
+        if os.path.commonpath([root, full]) != root or not os.path.isfile(full):
+            return ""
+        ext = os.path.splitext(full)[1].lstrip(".").lower()
+        mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp"}.get(ext, "image/png")
+        with open(full, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        return f'<img src="data:{mime};base64,{b64}" alt="图集"/>'
+    except Exception:
+        return ""
+
+
 def _entry_html(e) -> str:
     star = "★ " if e["is_favorite"] else ""
     body = ""
@@ -88,9 +115,23 @@ def _entry_html(e) -> str:
         val = (e.get(key) or "").strip()
         if val:
             body += f'<p><span class="lb">{label}：</span><br/>{html.escape(val)}</p>'
+    # 2026-09-13（1-A-5 收尾）：自定义字段（显示名, 值），由 export_html 预先附到 _custom_rows
+    for _lb, _v in (e.get("_custom_rows") or []):
+        body += (f'<p><span class="lb">{html.escape(str(_lb))}：</span><br/>'
+                 f'{html.escape(str(_v))}</p>')
+    # 2026-09-13（1-C-4）：标签（同样由 export_html 预先附到 _tag_names）
+    _tgs = [str(t) for t in (e.get("_tag_names") or []) if str(t).strip()]
+    if _tgs:
+        body += (f'<p><span class="lb">🏷 标签：</span>'
+                 f'{html.escape("、".join(_tgs))}</p>')
     img = _image_tag(e)
     if img:
         body += f"<p>{img}</p>"
+    # 2026-09-13（2-d）：图集（本地图 base64 内嵌、外链图直接用网址），由 export_html 预先附到 _gallery
+    for _gi, _g in enumerate(e.get("_gallery") or []):
+        tag = _gallery_img_tag(_g)
+        if tag:
+            body += f'<p><span class="lb">图集 {_gi + 1}：</span><br/>{tag}</p>'
     cn = html.escape(e.get("prompt_cn") or "")
     en = html.escape(e.get("prompt_en") or "")
     prompt = (
@@ -116,30 +157,64 @@ def _section_html(title: str, entries) -> str:
     return "".join(body)
 
 
-def export_html(db, path, category_id=None) -> int:
-    """导出全部（或指定分类子树）为单文件 HTML；返回导出的条目数"""
+def export_html(db, path, category_id=None, project_id=None, domain_id=None) -> int:
+    """导出全部（或指定"分类 / 根目录 / 项目类别"子树）为单文件 HTML；返回导出的条目数
+
+    2026-09-22（用户要求 3-1）：新增 project_id / domain_id——按"项目类别""根目录"导出
+    该分支下的全部条目。范围解析与 JSON 导出共用 `json_io._scope_categories`；
+    三者只需传其一（优先级 category_id > domain_id > project_id），皆不传＝全库（行为不变）。
+    """
     sections = []   # [(维度标题或None, [(分类标题, 条目列表), …])]
     total = 0
-    if category_id is None:
+    # 2026-09-13（1-A-5 收尾）：为条目附上"自定义字段（显示名, 值）"，供 _entry_html 展示
+    custom_defs = [d for d in db.list_field_defs() if not d.get("is_builtin")]
+
+    def _with_custom(es):
+        for _e in es:
+            rows = []
+            try:
+                _vals = {r["field_key"]: r["value_text"]
+                         for r in db.list_entry_field_values(_e["id"])}
+            except Exception:
+                _vals = {}
+            for _d in custom_defs:
+                _v = (_vals.get(_d["field_key"]) or "").strip()
+                if _v:
+                    rows.append((_d["display_name"], _v))
+            _e["_custom_rows"] = rows
+            # 2026-09-13（1-C-4）：标签名（供 _entry_html 展示）
+            try:
+                _e["_tag_names"] = db.list_entry_tag_names(_e["id"])
+            except Exception:
+                _e["_tag_names"] = []
+            # 2026-09-13（2-d）：图集（供 _entry_html 展示；本地图将 base64 内嵌）
+            try:
+                _e["_gallery"] = db.list_entry_images(_e["id"])
+            except Exception:
+                _e["_gallery"] = []
+        return es
+
+    if category_id is None and project_id is None and domain_id is None:
         # 按领域分组：领域 → 一级(维度) → 二级(分类)
         for d in db.list_domains():
             domain_sections = []
             for l1 in db.list_categories(domain_id=d["id"], parent_id=None):
                 for l2 in db.list_categories(parent_id=l1["id"]):
-                    es = db.list_entries(l2["id"])
+                    es = _with_custom(db.list_entries(l2["id"]))
                     domain_sections.append((f"{l1['name']} / {l2['name']}", es))
                     total += len(es)
             sections.append((d["name"], domain_sections))
     else:
-        # 子树导出：以根分类为标题（含路径上下文）
-        chain = _ancestor_chain_cats(db, category_id)
-        root_title = " / ".join(c["name"] for c in chain)
-        cat_ids = [c["id"] for c in _gather_categories(db, parent_id=category_id)]
-        subs = [(c["name"], db.list_entries(c["id"])) for c in
-                _gather_categories(db, parent_id=category_id)]
+        # 2026-09-22（用户要求 3-1）：统一走 `_scope_categories`——分类 / 根目录 / 项目类别
+        #   三种范围共用一套解析（分类范围含祖先链，仅作路径上下文，不重复出节）。
+        cats, scope = _scope_categories(db, category_id=category_id,
+                                        domain_id=domain_id, project_id=project_id)
+        subs = [(c["name"], _with_custom(db.list_entries(c["id"])))
+                for c in cats if (scope is None or c["id"] in scope)]
         for _, es in subs:
             total += len(es)
-        sections.append((root_title, subs))
+        sections.append((scope_title(db, category_id=category_id,
+                                     domain_id=domain_id, project_id=project_id), subs))
 
     body_html = []
     for group_title, subs in sections:

@@ -20,13 +20,18 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 
 from .config import (data_dir, IMAGES_DIR_NAME, PRESET_DOMAINS, PROJECT_PRESETS,
-                     PROJECT_FALLBACK, PROJECT_DOMAIN_MAPPING)
-from .models import Entry  # 2026-08-18（P2-5）：Domain/Category 冗余数据类已删除，仅保留 Entry
+                     PROJECT_FALLBACK, PROJECT_DOMAIN_MAPPING,
+                     META_HOTWORDS, META_HOTWORD_SOURCES,
+                     META_DETAIL_HIDDEN_FIELDS)  # 2026-09-16（批次 14）：详情区手动隐藏字段 meta 键
+from .config import now_str as _cfg_now_str  # 2026-09-17（审核 R-4）：公共时间工具
+from .models import Entry, new_entry_uuid  # 2026-09-17（FR-93）：条目稳定 ID 生成器
 
 
 def _now() -> str:
-    """当前时间字符串（用于 created_at / updated_at）"""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """当前时间字符串（用于 created_at / updated_at）
+    2026-09-17（审核 R-4）：实现统一到 `config.now_str()`，本函数保留为薄封装。
+    """
+    return _cfg_now_str()
 
 
 # 建表 SQL（schema v3，2026-08-29 四级分类施工）：
@@ -90,8 +95,16 @@ CREATE TABLE IF NOT EXISTS entries (
     image_path  TEXT DEFAULT '',
     is_favorite INTEGER DEFAULT 0,
     created_at  TEXT,
-    updated_at  TEXT
+    updated_at  TEXT,
+    -- 2026-09-17（FR-93，schema v5）：条目**稳定身份**（uuid4 hex，跨机器一致）。
+    --   空串 = 尚未分配（正常不会为空：新增自动生成、老库迁移回填）。
+    --   放在最后，与老库 ALTER TABLE ADD COLUMN 的追加位置保持一致（顺序语义不敏感，仅便于核对）。
+    uuid        TEXT DEFAULT ''
 );
+
+-- 2026-09-17（FR-93，schema v5）：uuid 的**部分唯一索引**——空串（未分配）不参与唯一性约束。
+-- 注意：本语句**不能**放进旧库的建表脚本早期执行（旧表尚无 uuid 列）⇒
+--   实际由 `_migrate_v4_to_v5()` 在"补列完成之后"执行（本处仅对新库生效）。
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -124,10 +137,150 @@ CREATE TABLE IF NOT EXISTS trash (
     reason      TEXT DEFAULT ''         -- 删除来源：手动删除 / 级联删除
 );
 CREATE INDEX IF NOT EXISTS idx_trash_deleted ON trash(deleted_at);
+
+-- 2026-09-13（schema v4，第 1 期地基）字段定义：把详情区"板块"变为可配置元数据。
+-- 内置 10 项以 is_builtin=1 预置（可改名、不可删除）；自定义字段用 field_key = custom_xxx。
+CREATE TABLE IF NOT EXISTS field_defs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    field_key     TEXT NOT NULL UNIQUE,
+    display_name  TEXT NOT NULL,
+    field_type    TEXT NOT NULL,          -- text/textarea/link/image/list/number/date/bool/tag/file/audio
+    is_builtin    INTEGER DEFAULT 0,
+    sort_order    INTEGER DEFAULT 0,
+    config_json   TEXT DEFAULT '',
+    archived      INTEGER DEFAULT 0,
+    created_at    TEXT,
+    updated_at    TEXT
+);
+
+-- 2026-09-13（schema v4）：自定义字段取值（键值对）。内置 10 字段仍存 entries 既有列，不写入本表。
+CREATE TABLE IF NOT EXISTS entry_field_values (
+    entry_id   INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    field_key  TEXT NOT NULL,
+    value_text TEXT DEFAULT '',
+    value_json TEXT DEFAULT '',
+    updated_at TEXT,
+    PRIMARY KEY (entry_id, field_key)
+);
+CREATE INDEX IF NOT EXISTS idx_efv_key ON entry_field_values(field_key, entry_id);
+
+-- 2026-09-13（schema v4）：列表框"取值/关联"。本期仅用 ref_type='static'（自定义序列型），
+-- 结构一次定义到位，后期补 category/entry/project/domain 时无需改表。
+CREATE TABLE IF NOT EXISTS entry_ref_links (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id       INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    field_key      TEXT NOT NULL,
+    ref_type       TEXT NOT NULL DEFAULT 'static',
+    ref_id         TEXT DEFAULT '',
+    label          TEXT DEFAULT '',
+    label_snapshot TEXT DEFAULT '',
+    sort_order     INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_erl_entry ON entry_ref_links(entry_id, field_key);
+
+-- 2026-09-13（schema v4）：标签。namespace 区分"全局标签"(__global__) 与"字段级标签"(field_key)。
+CREATE TABLE IF NOT EXISTS tags (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    namespace  TEXT NOT NULL DEFAULT '__global__',
+    name       TEXT NOT NULL,
+    color      TEXT DEFAULT '',
+    created_at TEXT,
+    updated_at TEXT,
+    UNIQUE(namespace, name)
+);
+
+-- 2026-09-13（schema v4）：条目 ↔ 标签（多对多）
+CREATE TABLE IF NOT EXISTS entry_tags (
+    entry_id   INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    tag_id     INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    created_at TEXT,
+    PRIMARY KEY (entry_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_entry_tags_tag ON entry_tags(tag_id, entry_id);
+
+-- 2026-09-13（第 2 期 2-a）：条目"图集"附加图。
+-- 说明：**封面仍存 entries.image_path**（保持既有行为），本表只存"附加图"（is_primary 预留）；
+-- kind='local' 时 path=images/entry_{id}_{n}.{ext}；kind='url' 时 source_url 为外链（可"下载到本地"转换）。
+CREATE TABLE IF NOT EXISTS entry_images (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id   INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL DEFAULT 'local',
+    path       TEXT DEFAULT '',
+    source_url TEXT DEFAULT '',
+    is_primary INTEGER DEFAULT 0,
+    sort_order INTEGER DEFAULT 0,
+    caption    TEXT DEFAULT '',
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_entry_images_entry ON entry_images(entry_id, sort_order);
 """
 
-# 数据库结构版本（meta 键 schema_version）；v1=旧版按领域归属分类，v2=全局分类+领域关联，v3=四级分类（项目类别）
-SCHEMA_VERSION = "3"
+# 数据库结构版本（meta 键 schema_version）；
+# v1=旧版按领域归属分类，v2=全局分类+领域关联，v3=四级分类（项目类别），v4=字段定义/自定义取值/标签
+SCHEMA_VERSION = "4"
+
+# schema v4：内置字段定义（field_key, 显示名, 类型, is_builtin, sort_order）
+# 说明：① 条目名称 也在其中（与界面 10 个区块一一对应）；⑩ 图像获取方案 为链接型。
+# 2026-09-16（批次 13，用户要求"详情区区块自由排序"）：新增 3 个**虚拟区块**
+#   （_tags 标签 / _location 位置 / _time 时间），它们不是 entries 表的真实字段，
+#   仅用于"详情区区块排序"——渲染时按 sort_order 决定位置，不存在对应的列。
+#   sort_order 用负数，确保排在内置 ②~⑩ 之前（与原有渲染顺序一致）。
+_PRESET_FIELDS = (
+    ("name", "① 条目名称", "text", 1, 0),
+    ("_location", "🧭 位置", "virtual", 1, -3),
+    ("_time", "🕒 时间", "virtual", 1, -2),
+    ("_tags", "🏷 标签", "virtual", 1, -1),
+    ("intro", "② 介绍", "textarea", 1, 1),
+    ("origin", "③ 溯源", "textarea", 1, 2),
+    ("features", "④ 核心特征", "textarea", 1, 3),
+    ("scenes", "⑤ 应用场景", "textarea", 1, 4),
+    ("works", "⑥ 代表作", "textarea", 1, 5),
+    ("image_desc", "⑦ 代表高清配图", "textarea", 1, 6),
+    ("prompt_cn", "⑧ 中文版提示词", "textarea", 1, 7),
+    ("prompt_en", "⑨ 英文版提示词", "textarea", 1, 8),
+    ("image_plan", "⑩ 图像获取方案", "link", 1, 9),
+)
+
+# schema v4：允许的字段类型白名单（防非法类型写入）
+FIELD_TYPES = ("text", "textarea", "link", "image", "list",
+               "number", "date", "bool", "tag", "file", "audio")
+
+# 2026-09-13（第 3 期 3-a）：列表框（list）字段的"数据源类型"。
+#   sequence   = 用户自定义静态序列（**已实现**）；
+#   tree_level = 目录层级型（项目类别/根目录/一级/二级；全部节点或指定父节点子树）——**3-b 已实现**；
+#   entries    = 条目型（全部/某分类下）——**预留，3-c 实现**。
+# 三类共用同一套公共能力（单选/多选、允许新建项、路径前缀、失联项占位），
+# 因判别字段与结构一次定义到位，后期补另两类**无需改表、无需数据迁移**。
+LIST_SOURCE_TYPES = ("sequence", "tree_level", "entries")
+
+# 2026-09-13（第 3 期 3-b）：「目录层级型」候选节点所在层级（对应四级目录树）。
+TREE_LEVELS = ("project", "domain", "cat1", "cat2")
+# 「目录层级型」的范围：all = 全库该层级全部节点；nodes = 仅取 node_refs 指定父节点子树内该层级节点。
+TREE_SCOPES = ("all", "nodes")
+
+
+def _ref_token(kind: str, oid: int) -> str:
+    """引用对象"稳定令牌"（project:2 / domain:5 / cat:12 / entry:34）——条目里存令牌，改名不影响引用。"""
+    return f"{kind}:{int(oid)}"
+
+
+def _parse_ref_token(token) -> tuple:
+    """解析引用令牌 → (kind, id)；非法返回 ("", 0)。"""
+    s = str(token or "").strip()
+    if ":" not in s:
+        return ("", 0)
+    kind, _, sid = s.partition(":")
+    if kind not in ("project", "domain", "cat", "entry") or not sid.isdigit():
+        return ("", 0)
+    return (kind, int(sid))
+
+
+# schema v4：内置字段键（顺序与 _PRESET_FIELDS 一致）；内置字段取值仍存 entries 既有列
+_BUILTIN_FIELD_KEYS = tuple(f[0] for f in _PRESET_FIELDS)
+
+# schema v4：标签命名空间——全局标签（条目级，用于跨分类聚合浏览）；
+# 字段级标签用相应 field_key 作 namespace（随 `tag` 类型字段一并提供，结构已就绪）
+GLOBAL_TAG_NS = "__global__"
 
 
 class Database:
@@ -157,18 +310,63 @@ class Database:
         return any(r["name"] == column for r in cols)
 
     def _migrate_if_needed(self) -> None:
-        """结构迁移：v1 → v2 → v3 按序执行（幂等）＋ v3 增量增强补列。
+        """结构迁移：v1 → v2 → v3 → v4 按序执行（幂等）＋ v3 增量增强补列。
 
         - v1→v2：旧版分类按 domain_id 归属单一领域 → 全局分类 + domain_category 多对一关联；
         - v2→v3：新增 projects 表 + domains.project_id 列 + 预置项目类别（四级分类最高层级）；
         - v3 增强（2026-08-29）：categories 加 created_at/updated_at 列（历史数据回填为旧时间戳，
           避免首次增量误把存量分类当"今日新增"）、新建 deletion_log 删除日志表。
+        - v3→v4（2026-09-13，第 1 期地基）：新增 field_defs/entry_field_values/entry_ref_links/
+          tags/entry_tags 五表（建表由 _SCHEMA_SQL 完成）＋ 预置内置 10 个字段定义；不搬动既有数据。
+        - v4→v5（2026-09-17，FR-93）：`entries` 补 `uuid` 列（条目**稳定身份**）＋ 回填 ＋
+          部分唯一索引；**不搬动既有数据**，不动 entry_links（多位置关系不变）。
         注：v2→v3 仅做"结构"升级（建表/加列/预置），不移动任何数据；
         根目录→项目类别的"归属分配"由 assign_domains_to_projects() 执行（迁移向导/自动迁移）。
         """
         self._migrate_v1_to_v2()
         self._migrate_v2_to_v3()
         self._ensure_v3_enhancements()
+        self._migrate_v3_to_v4()
+        # 2026-09-16（批次 13）：补齐详情区虚拟区块定义（_tags/_location/_time），
+        # 无论新库旧库都执行（幂等），确保老库也能使用"区块自由排序"功能。
+        self.ensure_virtual_blocks()
+        # 2026-09-17（FR-93，schema v5）：条目稳定 ID（uuid）——加列 + 回填 + 部分唯一索引。
+        self._migrate_v4_to_v5()
+
+    def _migrate_v4_to_v5(self) -> None:
+        """v4 → v5（2026-09-17，FR-93：条目**稳定 ID**）——**幂等**。
+
+        做什么：
+          1. 为 `entries` 补 `uuid` 列（**仅**老库需要；新库建表时已带该列）；
+          2. 为 `uuid` 为空/为 NULL 的条目**逐个回填** `new_entry_uuid()`（uuid4 hex）；
+          3. 建立**部分唯一索引** `idx_entries_uuid`（空串不参与唯一性）；
+          4. 写 `schema_version = "5"`。
+
+        **不搬动任何既有数据**：不动条目的任何字段，也不动 `entry_links`
+        （多位置关系仍按 `entries.id` 记录，uuid 只解决"跨机器认人"）。
+
+        重要（步骤顺序）：索引**必须**在补列之后建立——若把 `CREATE UNIQUE INDEX ... (uuid)`
+        放进 `_SCHEMA_SQL` 并在旧库上提前执行，会因"旧表没有 uuid 列"而报错。
+        故本方法在**版本已为 5 时也会**补建索引（防止极端情况下索引缺失）。
+        """
+        if self.get_meta("schema_version") != "5":
+            if not self._has_column("entries", "uuid"):
+                self.conn.execute("ALTER TABLE entries ADD COLUMN uuid TEXT DEFAULT ''")
+                self.conn.commit()
+            # 回填：只为"缺失"的条目生成（可重复执行，已分配的不动 ⇒ 幂等）
+            _ids = [r["id"] for r in self.conn.execute(
+                "SELECT id FROM entries WHERE uuid IS NULL OR uuid = ''").fetchall()]
+            for _eid in _ids:
+                self.conn.execute("UPDATE entries SET uuid = ? WHERE id = ?",
+                                  (new_entry_uuid(), _eid))
+            self.conn.commit()
+            self.set_meta("schema_version", "5")
+        # 索引：无论何时都确保存在（幂等；空串不参与唯一性）
+        if self._has_column("entries", "uuid"):
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_uuid"
+                " ON entries(uuid) WHERE uuid <> ''")
+            self.conn.commit()
 
     def _ensure_v3_enhancements(self) -> None:
         """v3 增量备份增强（幂等）：categories 时间戳列 + deletion_log 表 + entry_links 表。
@@ -233,8 +431,12 @@ class Database:
         self.set_meta("schema_version", "2")
 
     def _migrate_v2_to_v3(self) -> None:
-        """v2 → v3（结构升级，幂等）：projects 表 + domains.project_id 列 + 预置项目类别。"""
-        if self.get_meta("schema_version") == SCHEMA_VERSION:
+        """v2 → v3（结构升级，幂等）：projects 表 + domains.project_id 列 + 预置项目类别。
+
+        2026-09-13（schema v4）：本步骤的判定由"== 当前版本"改为"版本已≥v3 即跳过"，
+        并把目标版本写死为 "3"，使 v4 库不会重复执行本步骤（v4 升级交给 _migrate_v3_to_v4）。
+        """
+        if self.get_meta("schema_version") in ("3", "4"):
             return
         # 1. projects 表（_SCHEMA_SQL 已含 CREATE IF NOT EXISTS，确保旧库也有）
         self.conn.executescript(_SCHEMA_SQL)
@@ -247,7 +449,20 @@ class Database:
         # 3. 预置项目类别
         self.seed_preset_projects()
         # 4. 版本号
-        self.set_meta("schema_version", SCHEMA_VERSION)
+        self.set_meta("schema_version", "3")
+
+    def _migrate_v3_to_v4(self) -> None:
+        """v3 → v4（第 1 期地基，幂等）：字段定义等五表 + 预置内置字段。
+
+        新表由 _SCHEMA_SQL 的 CREATE TABLE IF NOT EXISTS 建立（init_schema 已执行），
+        本步骤只负责：预置内置 10 个字段定义（仅当 field_defs 为空）＋ 写版本号。
+        不搬动任何既有数据（内置 10 字段仍存 entries 既有列）。
+        """
+        if self.get_meta("schema_version") == "4":
+            return
+        self.conn.executescript(_SCHEMA_SQL)   # 旧库确保五表存在（幂等）
+        self.seed_preset_fields()
+        self.set_meta("schema_version", "4")
 
     def _normalize_dimension_prefixes(self) -> None:
         """归一化一级分类名称：移除"第X维度："前缀（幂等，兼容已按旧名导入的库）"""
@@ -266,6 +481,1152 @@ class Database:
                 changed = True
         if changed:
             self.conn.commit()
+
+    # ------------------------------------------------------------------ #
+    # 字段定义 FieldDef（2026-09-13 schema v4，第 1 期地基）
+    #   内置 10 项：可改名、不可删除；自定义项 field_key = custom_xxx。
+    #   本小节只含"元数据读写"最小集合，界面/搜索等按施工子步骤逐步接入。
+    # ------------------------------------------------------------------ #
+    def seed_preset_fields(self) -> None:
+        """预置内置 10 个字段定义（仅当 field_defs 表为空；幂等）"""
+        if self.conn.execute("SELECT COUNT(*) FROM field_defs").fetchone()[0]:
+            return
+        now = _now()
+        for field_key, display_name, field_type, is_builtin, order in _PRESET_FIELDS:
+            self.conn.execute(
+                "INSERT INTO field_defs(field_key, display_name, field_type, is_builtin,"
+                " sort_order, config_json, archived, created_at, updated_at)"
+                " VALUES(?,?,?,?,?,'',0,?,?)",
+                (field_key, display_name, field_type, is_builtin, order, now, now))
+        self.conn.commit()
+
+    # 2026-09-16（批次 13）：为已有数据库补齐"虚拟区块"定义（_tags/_location/_time）。
+    #   这三个区块不是 entries 表的真实列，仅用于详情区排序；老库在 schema v4 迁移时
+    #   只有 10 个内置字段，需要在此补齐。幂等：已存在则跳过。
+    def ensure_virtual_blocks(self) -> None:
+        """补齐虚拟区块定义（_tags / _location / _time），幂等。"""
+        now = _now()
+        existing = {r["field_key"] for r in self.conn.execute(
+            "SELECT field_key FROM field_defs").fetchall()}
+        for field_key, display_name, field_type, is_builtin, order in _PRESET_FIELDS:
+            if field_key.startswith("_") and field_key not in existing:
+                self.conn.execute(
+                    "INSERT INTO field_defs(field_key, display_name, field_type, is_builtin,"
+                    " sort_order, config_json, archived, created_at, updated_at)"
+                    " VALUES(?,?,?,?,?,'',0,?,?)",
+                    (field_key, display_name, field_type, is_builtin, order, now, now))
+        self.conn.commit()
+
+    def list_field_defs(self, include_archived: bool = False) -> List[dict]:
+        """按 sort_order 列出字段定义（默认不含已归档项）"""
+        sql = "SELECT * FROM field_defs"
+        if not include_archived:
+            sql += " WHERE archived = 0"
+        sql += " ORDER BY sort_order, id"
+        return [dict(r) for r in self.conn.execute(sql).fetchall()]
+
+    def get_field_def(self, field_key: str) -> Optional[dict]:
+        """按 field_key 取字段定义；不存在返回 None"""
+        row = self.conn.execute(
+            "SELECT * FROM field_defs WHERE field_key = ?", (field_key,)).fetchone()
+        return dict(row) if row else None
+
+    def rename_field_def(self, field_key: str, display_name: str) -> None:
+        """重命名字段显示名（仅改显示名，不改数据库列名，故不影响兼容）"""
+        self.conn.execute(
+            "UPDATE field_defs SET display_name = ?, updated_at = ? WHERE field_key = ?",
+            (display_name, _now(), field_key))
+        self.conn.commit()
+
+    def upsert_field_def(self, field_key: str, display_name: str,
+                         field_type: str = "text", is_builtin: int = 0,
+                         sort_order: Optional[int] = None, config_json: str = "",
+                         archived: int = 0) -> str:
+        """按 field_key 写入/更新字段定义（2026-09-13 第 4 期 4-a：JSON 随包恢复字段定义）。
+
+        - field_key 为空 → ValueError；field_type 不在白名单 → 回退 text（导入容错优先）；
+        - 已存在：更新显示名/类型/排序/配置/归档态，**不改 is_builtin**（内置仍是内置）；
+        - 不存在：按给定 key 插入（sort_order 缺省时追加到末尾）。
+        返回 field_key。
+        """
+        key = (field_key or "").strip()
+        if not key:
+            raise ValueError("field_key 不能为空")
+        ftype = field_type if field_type in FIELD_TYPES else "text"
+        name = (display_name or "").strip() or key
+        old = self.get_field_def(key)
+        now = _now()
+        if old is not None:
+            order = old["sort_order"] if sort_order is None else int(sort_order)
+            self.conn.execute(
+                "UPDATE field_defs SET display_name = ?, field_type = ?, sort_order = ?,"
+                " config_json = ?, archived = ?, updated_at = ? WHERE field_key = ?",
+                (name, ftype, order, config_json or "", 1 if archived else 0, now, key))
+        else:
+            order = (self.conn.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM field_defs").fetchone()[0]
+                if sort_order is None else int(sort_order))
+            self.conn.execute(
+                "INSERT INTO field_defs(field_key, display_name, field_type, is_builtin,"
+                " sort_order, config_json, archived, created_at, updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (key, name, ftype, 1 if is_builtin else 0, order, config_json or "",
+                 1 if archived else 0, now, now))
+        self.conn.commit()
+        return key
+
+    def field_defs_diff(self, incoming: list) -> List[dict]:
+        """比较"外来字段定义"与本地差异（2026-09-13：JSON 导入前逐项确认用，只读）。
+
+        返回 `[{field_key, display_name, status, incoming, current}]`：
+        - status = "new"：本地没有该字段（可直接新增）；
+        - status = "diff"：本地已有但显示名/类型/配置/归档态不同（由使用者决定是否覆盖）；
+        - status = "same"：完全一致（无需处理）。
+        """
+        out = []
+        for d in (incoming or []):
+            if not isinstance(d, dict) or not str(d.get("field_key") or "").strip():
+                continue
+            key = str(d["field_key"]).strip()
+            inc = {
+                "field_key": key,
+                "display_name": (d.get("display_name") or key),
+                "field_type": (d.get("field_type") or "text"),
+                "is_builtin": int(d.get("is_builtin") or 0),
+                "sort_order": int(d.get("sort_order") or 0),
+                "config_json": d.get("config_json") or "",
+                "archived": int(d.get("archived") or 0),
+            }
+            cur = self.get_field_def(key)
+            if cur is None:
+                status = "new"
+            else:
+                same = (str(cur.get("display_name") or "") == str(inc["display_name"])
+                        and (cur.get("field_type") or "text") == inc["field_type"]
+                        and (cur.get("config_json") or "") == inc["config_json"]
+                        and int(cur.get("archived") or 0) == inc["archived"])
+                status = "same" if same else "diff"
+            out.append({"field_key": key, "display_name": inc["display_name"],
+                        "status": status, "incoming": inc, "current": cur})
+        return out
+
+    def add_field_def(self, display_name: str, field_type: str = "text",
+                      config_json: str = "") -> str:
+        """新增一个**自定义字段**定义，返回生成的 field_key（custom_1、custom_2 …）。
+
+        - display_name 为空 → ValueError；
+        - field_type 不在 FIELD_TYPES 白名单 → ValueError；
+        - sort_order 追加到末尾；is_builtin 恒为 0（自定义字段）；
+        - field_key 自动取不冲突的 custom_N，调用方无需关心。
+        """
+        name = (display_name or "").strip()
+        if not name:
+            raise ValueError("字段显示名不能为空")
+        if field_type not in FIELD_TYPES:
+            raise ValueError(f"未知字段类型：{field_type}")
+        existing = {r["field_key"] for r in
+                    self.conn.execute("SELECT field_key FROM field_defs")}
+        n = 1
+        while f"custom_{n}" in existing:
+            n += 1
+        key = f"custom_{n}"
+        order = self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM field_defs").fetchone()[0]
+        now = _now()
+        self.conn.execute(
+            "INSERT INTO field_defs(field_key, display_name, field_type, is_builtin,"
+            " sort_order, config_json, archived, created_at, updated_at)"
+            " VALUES(?,?,?,0,?,?,0,?,?)",
+            (key, name, field_type, order, config_json or "", now, now))
+        self.conn.commit()
+        return key
+
+    # ------------------------------------------------------------------ #
+    # 字段"数据源"配置（列表框 list）——2026-09-13，第 3 期 3-a
+    #   存于 field_defs.config_json；判别字段一次定义到位（sequence/tree_level/entries），
+    #   后期补 tree_level/entries 时无需改表、无需迁移。
+    # ------------------------------------------------------------------ #
+    def get_field_config(self, field_key: str) -> dict:
+        """读取字段配置（解析失败/为空返回 {}）"""
+        row = self.conn.execute(
+            "SELECT config_json FROM field_defs WHERE field_key = ?",
+            (field_key,)).fetchone()
+        if row is None or not row["config_json"]:
+            return {}
+        try:
+            cfg = json.loads(row["config_json"])
+        except (TypeError, ValueError):
+            return {}
+        return cfg if isinstance(cfg, dict) else {}
+
+    def set_field_config(self, field_key: str, cfg: dict) -> None:
+        """写入字段配置（整体覆盖）"""
+        self.conn.execute(
+            "UPDATE field_defs SET config_json = ?, updated_at = ? WHERE field_key = ?",
+            (json.dumps(cfg or {}, ensure_ascii=False), _now(), field_key))
+        self.conn.commit()
+
+    def list_field_config(self, field_key: str) -> dict:
+        """列表框字段的"数据源配置"（缺省/异常时返回安全默认：序列型、空序列、单选）。
+
+        返回：{source_type, items, multi, allow_new, path_prefix, level, scope, node_refs}
+        - items     仅对 `sequence` 有意义（自定义序列）；
+        - level/scope/node_refs 仅对 `tree_level`（3-b）有意义；
+        - allow_new（允许新建项）只对 `sequence` 有效——层级型/条目型不能凭空造节点。
+        """
+        cfg = self.get_field_config(field_key) or {}
+        src = cfg.get("source_type")
+        if src not in LIST_SOURCE_TYPES:
+            src = "sequence"
+        items = []
+        for x in (cfg.get("items") or []):
+            s = str(x).strip()
+            if s and s not in items:
+                items.append(s)
+        level = cfg.get("level") if cfg.get("level") in TREE_LEVELS else "cat1"
+        scope = cfg.get("scope") if cfg.get("scope") in TREE_SCOPES else "all"
+        node_refs = []
+        for x in (cfg.get("node_refs") or []):
+            s = str(x).strip()
+            if _parse_ref_token(s)[0] and s not in node_refs:
+                node_refs.append(s)
+        return {
+            "source_type": src,
+            "items": items,
+            "multi": bool(cfg.get("multi")),
+            "allow_new": bool(cfg.get("allow_new", True)) and src == "sequence",
+            "path_prefix": bool(cfg.get("path_prefix")),
+            "level": level,
+            "scope": scope,
+            "node_refs": node_refs,
+        }
+
+    def resolve_list_options(self, field_key: str) -> List[dict]:
+        """列表框候选值统一入口 → [{"value": 存库值, "label": 显示文本}]。
+
+        - `sequence`（3-a）：用户自定义静态序列；
+        - `tree_level`（3-b）：目录层级型（项目类别/根目录/一级/二级），值为稳定令牌；
+        - `entries`（3-c）：条目型（全部条目 / 指定节点子树内条目），值为条目稳定令牌。
+        """
+        cfg = self.list_field_config(field_key)
+        if cfg["source_type"] == "sequence":
+            return [{"value": x, "label": x} for x in cfg["items"]]
+        if cfg["source_type"] == "tree_level":
+            return self.tree_level_options(cfg["level"], cfg["scope"],
+                                           cfg["node_refs"], cfg["path_prefix"])
+        if cfg["source_type"] == "entries":
+            return self.entries_options(cfg["scope"], cfg["node_refs"], cfg["path_prefix"])
+        return []
+
+    # ------------------------------------------------------------------ #
+    # 引用令牌的公共能力（3-b 目录层级型 / 3-c 条目型共用）
+    # ------------------------------------------------------------------ #
+    def ref_name(self, token: str) -> str:
+        """引用令牌 → 当前对象名（"指定节点"摘要、失联提示用）；找不到返回空串。"""
+        kind, oid = _parse_ref_token(token)
+        table = {"project": "projects", "domain": "domains",
+                 "cat": "categories", "entry": "entries"}.get(kind)
+        if not table:
+            return ""
+        row = self.conn.execute(f"SELECT name FROM {table} WHERE id = ?", (oid,)).fetchone()
+        return (row["name"] if row else "") or ""
+
+    def _ref_report(self, tokens) -> dict:
+        """统计"给定令牌被哪些自定义字段引用"（3-c 删除前提示用，只读）。
+
+        返回 {"total": 引用处数, "fields": [{"field_key","display_name","count"}]}。
+        """
+        toks = [str(t).strip() for t in (tokens or []) if _parse_ref_token(t)[0]]
+        if not toks:
+            return {"total": 0, "fields": []}
+        # 2026-09-17（审核报告 S-3）：转义 LIKE 通配符 `%` / `_`（及转义符自身 `\`），
+        #   并显式声明 ESCAPE —— 否则令牌里若含通配符会导致引用计数**偏多**。
+        #   （实际令牌形如 `cat:12` / `entry:345`，本不含这些字符；此处为防御性处理。）
+        def _like(t: str) -> str:
+            _e = (t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
+            return '%%"%s"%%' % _e      # 注意：% 需写成 %%（这里是 Python 格式化，不是 LIKE）
+        where = " OR ".join(["value_json LIKE ? ESCAPE '\\'"] * len(toks))
+        rows = self.conn.execute(
+            "SELECT field_key, COUNT(1) AS n FROM entry_field_values"
+            f" WHERE {where} GROUP BY field_key ORDER BY n DESC",
+            [_like(t) for t in toks]).fetchall()
+        names = {d["field_key"]: d["display_name"]
+                 for d in self.list_field_defs(include_archived=True)}
+        fields = [{"field_key": r["field_key"],
+                   "display_name": names.get(r["field_key"], r["field_key"]),
+                   "count": r["n"]} for r in rows]
+        return {"total": sum(f["count"] for f in fields), "fields": fields}
+
+    def refs_using_category(self, category_id: int) -> dict:
+        """该分类及其全部子分类被引用的情况（3-c：删除分类前提示）"""
+        return self._ref_report([_ref_token("cat", c)
+                                 for c in self._collect_category_ids(category_id)])
+
+    def refs_using_domain(self, domain_id: int) -> dict:
+        """该根目录被引用的情况（3-c：删除根目录前提示）"""
+        return self._ref_report([_ref_token("domain", domain_id)])
+
+    def refs_using_entry(self, entry_id: int) -> dict:
+        """该条目被引用的情况（3-c：删除条目前提示）"""
+        return self._ref_report([_ref_token("entry", entry_id)])
+
+    # ------------------------------------------------------------------ #
+    # 目录层级型数据源（列表框 list 的第 2 类数据源）——2026-09-13，第 3 期 3-b
+    #   候选节点来自既有四级目录树（项目类别 → 根目录 → 一级 → 二级）；
+    #   条目里保存"稳定令牌 + 快照名"，故目录改名不影响引用，
+    #   目录被删除后可精确识别为失联（占位显示见 3-b 界面层；删除提示见 3-c）。
+    # ------------------------------------------------------------------ #
+    def _tree_snapshot(self) -> dict:
+        """一次性取全量四级目录数据（项目/根目录/分类/领域↔一级关联），供候选枚举使用。"""
+        projects = {r["id"]: dict(r) for r in self.conn.execute("SELECT * FROM projects")}
+        domains = {r["id"]: dict(r) for r in self.conn.execute("SELECT * FROM domains")}
+        cats = {r["id"]: dict(r) for r in self.conn.execute("SELECT * FROM categories")}
+        links: dict = {}    # 分类 → [根目录]
+        dlinks: dict = {}   # 根目录 → [一级分类]（3-c：按节点圈定条目用）
+        for r in self.conn.execute("SELECT domain_id, category_id FROM domain_category"):
+            links.setdefault(r["category_id"], []).append(r["domain_id"])
+            dlinks.setdefault(r["domain_id"], []).append(r["category_id"])
+        return {"projects": projects, "domains": domains, "cats": cats,
+                "links": links, "dlinks": dlinks}
+
+    @staticmethod
+    def _cat_chain(cats: dict, cid: int) -> List[int]:
+        """分类 id 链：自身 → … → 一级（倒序存放；防环）"""
+        out = []
+        seen = set()
+        while cid and cid in cats and cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+            cid = cats[cid]["parent_id"]
+        return out
+
+    def _cat_domains(self, snap: dict, cid: int) -> List[int]:
+        """某分类（含其各级父分类）关联的全部根目录 id（多对多：一级分类可挂多个根目录）"""
+        out = set()
+        for c in self._cat_chain(snap["cats"], cid):
+            out |= set(snap["links"].get(c) or [])
+        return sorted(out, key=lambda d: (snap["domains"][d]["sort_order"], d))
+
+    def _cat_path(self, snap: dict, cid: int) -> List[str]:
+        """分类的显示路径：项目 / 根目录 / 一级 / 二级（取**首个**关联根目录；无关联则省略根目录）"""
+        doms = self._cat_domains(snap, cid)
+        path = []
+        if doms:
+            d = snap["domains"][doms[0]]
+            p = snap["projects"].get(d["project_id"])
+            if p:
+                path.append(p["name"])
+            path.append(d["name"])
+        path += [snap["cats"][c]["name"]
+                 for c in reversed(self._cat_chain(snap["cats"], cid))]
+        return path
+
+    def _cat_sort_key(self, snap: dict, cid: int) -> tuple:
+        """分类排序键（与左侧四级目录顺序一致：项目→根目录→层级→排序）"""
+        doms = self._cat_domains(snap, cid)
+        d = snap["domains"][doms[0]] if doms else None
+        p = snap["projects"].get(d["project_id"]) if d else None
+        return (p["sort_order"] if p else 9999,
+                d["sort_order"] if d else 9999,
+                len(self._cat_chain(snap["cats"], cid)),
+                snap["cats"][cid]["sort_order"], cid)
+
+    def _ref_category_ids(self, snap: dict, refs) -> set:
+        """给定父节点令牌集合（项目/根目录/分类）→ 其覆盖的**全部分类 id（含子树）**（3-c）"""
+        cats = snap["cats"]
+        children: dict = {}
+        for cid, c in cats.items():
+            children.setdefault(c["parent_id"], []).append(cid)
+
+        def subtree(cid):
+            out, stack = set(), [cid]
+            while stack:
+                x = stack.pop()
+                if x in out or x not in cats:
+                    continue
+                out.add(x)
+                stack.extend(children.get(x, []))
+            return out
+
+        out = set()
+        for tok in (refs or ()):
+            kind, oid = _parse_ref_token(tok)
+            if kind == "cat" and oid in cats:
+                out |= subtree(oid)
+            elif kind == "domain":
+                for cid in (snap["dlinks"].get(oid) or []):
+                    out |= subtree(cid)
+            elif kind == "project":
+                for did, d in snap["domains"].items():
+                    if d["project_id"] == oid:
+                        for cid in (snap["dlinks"].get(did) or []):
+                            out |= subtree(cid)
+        return out
+
+    def _tree_ancestors(self, snap: dict, kind: str, oid: int) -> set:
+        """节点的"自身 + 全部祖先"令牌集合（用于"指定节点"范围过滤）"""
+        if kind == "project":
+            return {_ref_token("project", oid)}
+        if kind == "domain":
+            out = {_ref_token("domain", oid)}
+            pid = snap["domains"][oid]["project_id"]
+            if pid:
+                out.add(_ref_token("project", pid))
+            return out
+        out = {_ref_token("cat", c) for c in self._cat_chain(snap["cats"], oid)}
+        for did in self._cat_domains(snap, oid):
+            out.add(_ref_token("domain", did))
+            pid = snap["domains"][did]["project_id"]
+            if pid:
+                out.add(_ref_token("project", pid))
+        return out
+
+    def tree_level_options(self, level: str = "cat1", scope: str = "all",
+                           node_refs=(), path_prefix: bool = True) -> List[dict]:
+        """目录层级型候选值 → [{"value": 稳定令牌, "label": 显示文本}]（3-b）。
+
+        - level：候选节点所在层级（project/domain/cat1/cat2）；
+        - scope：all=全库该层级全部节点；nodes=仅取 node_refs 指定父节点子树内该层级节点；
+        - path_prefix：True=显示完整层级路径（项目 / 根目录 / 一级 / 二级），False=只显示节点名。
+        """
+        if level not in TREE_LEVELS:
+            level = "cat1"
+        if scope not in TREE_SCOPES:
+            scope = "all"
+        refs = {str(x).strip() for x in (node_refs or []) if _parse_ref_token(x)[0]}
+        snap = self._tree_snapshot()
+        projects, domains, cats = snap["projects"], snap["domains"], snap["cats"]
+
+        items = []   # (排序键, 令牌, 节点名, 路径列表)
+        if level == "project":
+            for pid, p in projects.items():
+                if scope == "nodes" and not (self._tree_ancestors(snap, "project", pid) & refs):
+                    continue
+                items.append(((p["sort_order"], 0, 0, pid), _ref_token("project", pid),
+                              p["name"], [p["name"]]))
+        elif level == "domain":
+            for did, d in domains.items():
+                if scope == "nodes" and not (self._tree_ancestors(snap, "domain", did) & refs):
+                    continue
+                p = projects.get(d["project_id"])
+                path = ([p["name"]] if p else []) + [d["name"]]
+                items.append(((p["sort_order"] if p else 9999, d["sort_order"], 0, did),
+                              _ref_token("domain", did), d["name"], path))
+        else:
+            want_depth = 1 if level == "cat1" else 2
+            for cid, c in cats.items():
+                if len(self._cat_chain(cats, cid)) != want_depth:
+                    continue
+                if scope == "nodes" and not (self._tree_ancestors(snap, "cat", cid) & refs):
+                    continue
+                items.append((self._cat_sort_key(snap, cid), _ref_token("cat", cid),
+                              c["name"], self._cat_path(snap, cid)))
+        items.sort(key=lambda x: x[0])
+        return [{"value": token,
+                 "label": (" / ".join(path) if path_prefix else name)}
+                for _key, token, name, path in items]
+
+    # ------------------------------------------------------------------ #
+    # 条目型数据源（列表框 list 的第 3 类数据源）——2026-09-13，第 3 期 3-c
+    #   候选＝全库条目 或 node_refs 指定节点（项目/根目录/分类）子树内的条目；
+    #   同样存"稳定令牌 + 快照名"（entry:{id}），条目改名跟随、删除显示失联占位。
+    # ------------------------------------------------------------------ #
+    def entries_options(self, scope: str = "all", node_refs=(),
+                        path_prefix: bool = True) -> List[dict]:
+        """条目型候选值 → [{"value": "entry:{id}", "label": 显示文本}]（3-c）。
+
+        - scope：all=全库条目；nodes=仅取 node_refs 指定节点子树内的条目；
+        - path_prefix：True=显示"分类路径 / 条目名"，False=只显示条目名。
+        """
+        if scope not in TREE_SCOPES:
+            scope = "all"
+        snap = self._tree_snapshot()
+        allowed = None
+        if scope == "nodes":
+            allowed = self._ref_category_ids(snap, node_refs)
+            if not allowed:
+                return []          # 未指定节点 → 无候选（界面会提示）
+        rows = self.conn.execute(
+            "SELECT id, name, category_id FROM entries").fetchall()
+        items = []
+        for r in rows:
+            cid = r["category_id"]
+            if allowed is not None and cid not in allowed:
+                continue
+            key = self._cat_sort_key(snap, cid) if cid in snap["cats"] else (9998, 9998, 0, 0, 0)
+            path = self._cat_path(snap, cid) if cid in snap["cats"] else []
+            items.append((key + (r["name"] or "", r["id"]), r["id"],
+                          r["name"] or "", path))
+        items.sort(key=lambda x: x[0])
+        return [{"value": _ref_token("entry", eid),
+                 "label": (" / ".join(path + [name]) if (path_prefix and path) else name)}
+                for _key, eid, name, path in items]
+
+    def archive_field_def(self, field_key: str) -> None:
+        """归档（=界面上的"删除"）一个自定义字段定义。
+
+        2026-09-13（1-A-5 第 3 步，用户确认的语义）：**只隐藏、不删数据**——
+        归档后该字段不再出现在详情区与字段列表（默认），但 `entry_field_values` 中
+        已填写的内容全部保留，可通过 restore_field_def() 恢复。
+        内置字段（is_builtin=1）不允许归档 → ValueError。
+        """
+        d = self.get_field_def(field_key)
+        if d is None:
+            raise ValueError(f"字段不存在：{field_key}")
+        if d.get("is_builtin"):
+            raise ValueError("内置字段不可删除（可改名）")
+        self.conn.execute(
+            "UPDATE field_defs SET archived = 1, updated_at = ? WHERE field_key = ?",
+            (_now(), field_key))
+        self.conn.commit()
+
+    def restore_field_def(self, field_key: str) -> None:
+        """恢复一个已归档的自定义字段（取值本就保留，恢复后立即回到详情区）"""
+        self.conn.execute(
+            "UPDATE field_defs SET archived = 0, updated_at = ? WHERE field_key = ?",
+            (_now(), field_key))
+        self.conn.commit()
+
+    # ------------------------------------------------------------------ #
+    # 2026-09-16（批次 14，用户要求"字段管理中各区块可逐个隐藏/显示"）
+    #   详情区"手动隐藏"字段：**纯显示偏好**，存 meta 表（逗号分隔的 field_key），
+    #   不改 field_defs 表结构、不改导入导出格式；被隐藏字段的内容仍在库中，
+    #   照常导出、照常参与搜索，取消隐藏后立即回到详情区。
+    #   语义为**硬隐藏**：无论详情字段显示策略如何都不显示（详见 config 注释）。
+    # ------------------------------------------------------------------ #
+    def get_hidden_field_keys(self) -> set:
+        """读取详情区"手动隐藏"的字段键集合（无设置/异常时返回空集合）。
+
+        - ① 名称（field_key="name"）**永不隐藏**：读取时直接剔除，
+          保证任何写入路径（含手工改库）都无法把名称项隐藏掉；
+        - 只做"去空、去重、剔除 name"，不校验字段是否存在
+          （字段可能稍后被归档/删除，此处无需强耦合）。
+        """
+        try:
+            raw = self.get_meta(META_DETAIL_HIDDEN_FIELDS) or ""
+        except Exception:                                   # noqa: BLE001
+            return set()
+        out = set()
+        for part in str(raw).split(","):
+            k = part.strip()
+            if k and k != "name":
+                out.add(k)
+        return out
+
+    def set_hidden_field_keys(self, keys) -> None:
+        """写入详情区"手动隐藏"的字段键集合（排序后逗号拼接，幂等）。
+
+        写入前统一过滤：空串剔除、去重、**剔除 name**（名称项不可隐藏）。
+        """
+        safe = sorted({str(k).strip() for k in (keys or [])
+                       if str(k).strip() and str(k).strip() != "name"})
+        self.set_meta(META_DETAIL_HIDDEN_FIELDS, ",".join(safe))
+
+    def _touch_entry_updated_at(self, entry_id: int) -> None:
+        """把条目的 `entries.updated_at` 刷新为当前时间（2026-09-14，审核修复 P1-D）。
+
+        为什么需要：每日变更包按 `entries.updated_at >= 当日` 采集条目
+        （`incremental_backup.collect_daily_changes`）。标签与自定义字段的取值存在
+        **独立表**里，若只写这两张表而不动 `entries.updated_at`，那么"只打了标签 /
+        只改了自定义字段"的改动**不会进当日变更包**，换机同步会**静默丢数据**。
+        因此所有"标签 / 自定义字段取值"的写入口都要同步 touch 一次本条目的时间戳。
+        """
+        self.conn.execute("UPDATE entries SET updated_at = ? WHERE id = ?",
+                          (_now(), entry_id))
+
+    # ---- 自定义字段取值（entry_field_values）-------------------------- #
+    def set_entry_field_value(self, entry_id: int, field_key: str,
+                              value_text: str = "", value_json: str = "") -> None:
+        """写入/更新一个自定义字段取值（upsert）。
+
+        约定：内置 10 字段仍写 entries 既有列，**不调用本方法**；
+        本方法只服务 field_key = custom_xxx 的自定义字段。
+
+        2026-09-17（审核报告 M-2）：把上述"隐式契约"**显式化**——对非 `custom_` 前缀的
+        `field_key` 直接抛 `ValueError`。拒绝两类误用：
+          · 内置 10 字段（name/intro/…）：它们的值在 `entries` 的列里，写进本表会造成
+            "同一字段两处存储"的不一致；
+          · 虚拟区块（`_tags` / `_location` / `_time`）：它们只是详情区的显示区块，
+            **不是条目的真实字段**，不应有取值。
+        现有调用方（UI 的 `_extra_field_getters`、导入路径、自测）本就只传自定义字段，
+        故本断言**不改变任何既有行为**，只为将来新增调用点时兜底。
+        """
+        _k = str(field_key or "")
+        if not _k.startswith("custom_"):
+            raise ValueError(
+                "set_entry_field_value() 仅接受 custom_ 前缀的自定义字段，收到：%r" % field_key)
+        self.conn.execute(
+            "INSERT INTO entry_field_values(entry_id, field_key, value_text, value_json,"
+            " updated_at) VALUES(?,?,?,?,?)"
+            " ON CONFLICT(entry_id, field_key) DO UPDATE SET"
+            " value_text = excluded.value_text, value_json = excluded.value_json,"
+            " updated_at = excluded.updated_at",
+            (entry_id, _k, value_text or "", value_json or "", _now()))
+        self._touch_entry_updated_at(entry_id)   # P1-D：让变更包能采集到这次改动
+        self.conn.commit()
+
+    def get_entry_field_value(self, entry_id: int, field_key: str) -> Optional[str]:
+        """取单个自定义字段取值文本；未写入返回 None（区别于"写入空串"）"""
+        row = self.conn.execute(
+            "SELECT value_text FROM entry_field_values WHERE entry_id = ? AND field_key = ?",
+            (entry_id, field_key)).fetchone()
+        return row["value_text"] if row else None
+
+    def list_entry_field_values(self, entry_id: int) -> List[dict]:
+        """列出某条目的全部自定义字段取值行（原始结构，含 value_text/value_json）"""
+        rows = self.conn.execute(
+            "SELECT field_key, value_text, value_json, updated_at FROM entry_field_values"
+            " WHERE entry_id = ? ORDER BY field_key", (entry_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_entry_field_value(self, entry_id: int, field_key: str) -> None:
+        """删除某条目的某自定义字段取值（如清空该字段）"""
+        self.conn.execute(
+            "DELETE FROM entry_field_values WHERE entry_id = ? AND field_key = ?",
+            (entry_id, field_key))
+        self._touch_entry_updated_at(entry_id)   # P1-D：清空也是一次改动
+        self.conn.commit()
+
+    def get_entry_fields(self, entry_id: int) -> dict:
+        """统一字段读取层（第 1 期地基）：返回"内置 10 项 + 自定义项"合并字典。
+
+        - 内置项：取自 entries 既有列，**始终返回**（无值则为 ''），与既有读取习惯一致；
+        - 自定义项：取自 entry_field_values.value_text，仅返回已写入的项；
+        - 内置键优先：若存在同键的取值行（正常不会发生），不覆盖内置值。
+        供详情区/导出/复制/备份等统一消费，避免各处各写一份字段清单。
+        条目不存在时返回空 dict。
+        """
+        e = self.get_entry(entry_id)
+        if e is None:
+            return {}
+        out = {k: (e.get(k) or "") for k in _BUILTIN_FIELD_KEYS}
+        for r in self.conn.execute(
+                "SELECT field_key, value_text FROM entry_field_values"
+                " WHERE entry_id = ? ORDER BY field_key", (entry_id,)):
+            if r["field_key"] not in out:
+                out[r["field_key"]] = r["value_text"] or ""
+        return out
+
+    # ------------------------------------------------------------------ #
+    # 标签 Tag（2026-09-13 schema v4，第 1 期 1-C-1）
+    #   全局标签 namespace=GLOBAL_TAG_NS；字段级标签用 field_key 作 namespace（结构已就绪）。
+    #   标签只是"多对多关联"，删除标签不影响条目本身；删除条目会级联清理关联。
+    # ------------------------------------------------------------------ #
+    def list_tags(self, namespace: str = GLOBAL_TAG_NS) -> List[dict]:
+        """列出某命名空间下的全部标签（按名称排序）"""
+        rows = self.conn.execute(
+            "SELECT * FROM tags WHERE namespace = ? ORDER BY name", (namespace,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_tags_with_counts(self, namespace: str = GLOBAL_TAG_NS) -> List[dict]:
+        """列出标签 + 关联条目数（计数降序、同名升序）——标签云/列表数据源。"""
+        rows = self.conn.execute(
+            "SELECT t.*, COUNT(et.entry_id) AS entry_count FROM tags t"
+            " LEFT JOIN entry_tags et ON et.tag_id = t.id"
+            " WHERE t.namespace = ?"
+            " GROUP BY t.id ORDER BY entry_count DESC, t.name", (namespace,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_tag(self, tag_id: int) -> Optional[dict]:
+        row = self.conn.execute("SELECT * FROM tags WHERE id = ?", (tag_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_tag_by_name(self, name: str, namespace: str = GLOBAL_TAG_NS) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM tags WHERE namespace = ? AND name = ?",
+            (namespace, (name or "").strip())).fetchone()
+        return dict(row) if row else None
+
+    def add_tag(self, name: str, namespace: str = GLOBAL_TAG_NS, color: str = "") -> int:
+        """新建标签；已存在同名同命名空间则直接复用其 id（幂等）。空名 → ValueError。"""
+        n = (name or "").strip()
+        if not n:
+            raise ValueError("标签名不能为空")
+        existing = self.get_tag_by_name(n, namespace)
+        if existing:
+            return existing["id"]
+        now = _now()
+        cur = self.conn.execute(
+            "INSERT INTO tags(namespace, name, color, created_at, updated_at)"
+            " VALUES(?,?,?,?,?)", (namespace, n, color or "", now, now))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def rename_tag(self, tag_id: int, new_name: str) -> None:
+        """重命名标签；目标名已被同命名空间其它标签占用 → ValueError（请改用 merge_tags）。"""
+        n = (new_name or "").strip()
+        if not n:
+            raise ValueError("标签名不能为空")
+        t = self.get_tag(tag_id)
+        if t is None:
+            raise ValueError("标签不存在")
+        dup = self.get_tag_by_name(n, t["namespace"])
+        if dup and dup["id"] != tag_id:
+            raise ValueError(f"已存在同名标签「{n}」，请使用「合并」功能")
+        self.conn.execute("UPDATE tags SET name = ?, updated_at = ? WHERE id = ?",
+                          (n, _now(), tag_id))
+        self.conn.commit()
+
+    def set_field_type(self, field_key: str, field_type: str) -> None:
+        """修改**自定义字段**的类型（2026-09-14，审核补充 P5）。
+
+        - 内置 10 项不允许改类型（方案：内置仅可改名）→ 抛 `ValueError`；
+        - `field_type` 不在白名单 → 抛 `ValueError`；
+        - **只**更新 `field_type` 与 `updated_at`，不动 `config_json`（避免误清"列表框数据源"配置）、
+          排序与归档态；类型未变化时直接返回。
+        """
+        d = self.get_field_def(field_key)
+        if d is None:
+            raise ValueError("字段不存在")
+        if d.get("is_builtin"):
+            raise ValueError("内置字段不可修改类型（仅可改名）")
+        if field_type not in FIELD_TYPES:
+            raise ValueError(f"未知字段类型：{field_type}")
+        if d.get("field_type") == field_type:
+            return
+        self.conn.execute(
+            "UPDATE field_defs SET field_type = ?, updated_at = ? WHERE field_key = ?",
+            (field_type, _now(), field_key))
+        self.conn.commit()
+
+    def merge_tags(self, src_tag_id: int, dst_tag_id: int) -> None:
+        """把 src 标签的全部条目关联并入 dst 标签，然后删除 src（同名冲突的合并入口）。"""
+        if src_tag_id == dst_tag_id:
+            return
+        if self.get_tag(src_tag_id) is None or self.get_tag(dst_tag_id) is None:
+            raise ValueError("标签不存在")
+        # P1-D：受影响的条目（其标签集合发生变化）需要刷新 updated_at，才能进当日变更包
+        _ids = [r["entry_id"] for r in self.conn.execute(
+            "SELECT entry_id FROM entry_tags WHERE tag_id = ?", (src_tag_id,)).fetchall()]
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO entry_tags(entry_id, tag_id, created_at)"
+                    " SELECT entry_id, ?, created_at FROM entry_tags WHERE tag_id = ?",
+                    (dst_tag_id, src_tag_id))
+                self.conn.execute("DELETE FROM entry_tags WHERE tag_id = ?", (src_tag_id,))
+                self.conn.execute("DELETE FROM tags WHERE id = ?", (src_tag_id,))
+                for _eid in _ids:
+                    self._touch_entry_updated_at(_eid)
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_tag(self, tag_id: int) -> None:
+        """删除标签及其全部条目关联（**不影响条目本身**）"""
+        # P1-D：被摘掉标签的条目需刷新 updated_at，否则这次改动进不了当日变更包
+        _ids = [r["entry_id"] for r in self.conn.execute(
+            "SELECT entry_id FROM entry_tags WHERE tag_id = ?", (tag_id,)).fetchall()]
+        self.conn.execute("DELETE FROM entry_tags WHERE tag_id = ?", (tag_id,))
+        self.conn.execute("DELETE FROM tags WHERE id = ?", (tag_id,))
+        for _eid in _ids:
+            self._touch_entry_updated_at(_eid)
+        self.conn.commit()
+
+    def purge_unused_tags(self, namespace: str = GLOBAL_TAG_NS) -> int:
+        """清理该命名空间下"无任何条目关联"的标签，返回清理数量。"""
+        cur = self.conn.execute(
+            "DELETE FROM tags WHERE namespace = ? AND id NOT IN"
+            " (SELECT tag_id FROM entry_tags)", (namespace,))
+        self.conn.commit()
+        return cur.rowcount or 0
+
+    # ---- 条目 ↔ 标签 ---- #
+    def list_entry_tags(self, entry_id: int, namespace: str = GLOBAL_TAG_NS) -> List[dict]:
+        """某条目已打的标签（含 id/name/color，按名称排序）"""
+        rows = self.conn.execute(
+            "SELECT t.* FROM tags t JOIN entry_tags et ON et.tag_id = t.id"
+            " WHERE et.entry_id = ? AND t.namespace = ? ORDER BY t.name",
+            (entry_id, namespace)).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_entry_tags(self, entry_id: int, names, namespace: str = GLOBAL_TAG_NS) -> None:
+        """按名称列表**整体替换**某条目的标签（缺失的标签自动创建）。用于详情区标签保存。"""
+        cleaned, seen = [], set()
+        for n in (names or []):
+            s = (n or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                cleaned.append(s)
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "DELETE FROM entry_tags WHERE entry_id = ? AND tag_id IN"
+                    " (SELECT id FROM tags WHERE namespace = ?)", (entry_id, namespace))
+                now = _now()
+                for s in cleaned:
+                    tid = self.conn.execute(
+                        "SELECT id FROM tags WHERE namespace = ? AND name = ?",
+                        (namespace, s)).fetchone()
+                    if tid is None:
+                        cur = self.conn.execute(
+                            "INSERT INTO tags(namespace, name, color, created_at, updated_at)"
+                            " VALUES(?,?,'',?,?)", (namespace, s, now, now))
+                        tid = cur.lastrowid
+                    else:
+                        tid = tid["id"]
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO entry_tags(entry_id, tag_id, created_at)"
+                        " VALUES(?,?,?)", (entry_id, tid, now))
+                self._touch_entry_updated_at(entry_id)   # P1-D
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def add_entry_tag(self, entry_id: int, name: str,
+                      namespace: str = GLOBAL_TAG_NS) -> int:
+        """给条目追加一个标签（不存在则新建），返回 tag_id"""
+        tid = self.add_tag(name, namespace)
+        self.conn.execute(
+            "INSERT OR IGNORE INTO entry_tags(entry_id, tag_id, created_at) VALUES(?,?,?)",
+            (entry_id, tid, _now()))
+        self._touch_entry_updated_at(entry_id)           # P1-D
+        self.conn.commit()
+        return tid
+
+    def remove_entry_tag(self, entry_id: int, tag_id: int) -> None:
+        self.conn.execute(
+            "DELETE FROM entry_tags WHERE entry_id = ? AND tag_id = ?", (entry_id, tag_id))
+        self._touch_entry_updated_at(entry_id)           # P1-D
+        self.conn.commit()
+
+    def list_entries_by_tags(self, tag_ids, mode: str = "and",
+                             namespace: str = GLOBAL_TAG_NS) -> List[dict]:
+        """按标签**跨分类**查询条目。
+
+        - mode="and"：同时包含全部给定标签；
+        - mode="or" ：包含任一给定标签。
+        返回与其它 list_* 一致的 entries 行（按 updated_at DESC, id 排序）；无 tag_ids 返回 []。
+        """
+        ids = [int(t) for t in (tag_ids or [])]
+        if not ids:
+            return []
+        ph = ",".join("?" * len(ids))
+        if mode == "and":
+            sql = ("SELECT e.* FROM entries e JOIN entry_tags et ON et.entry_id = e.id"
+                   " WHERE et.tag_id IN (" + ph + ")"
+                   " GROUP BY e.id HAVING COUNT(DISTINCT et.tag_id) = ?"
+                   " ORDER BY e.updated_at DESC, e.id")
+            params = tuple(ids) + (len(ids),)
+        else:
+            sql = ("SELECT DISTINCT e.* FROM entries e JOIN entry_tags et ON et.entry_id = e.id"
+                   " WHERE et.tag_id IN (" + ph + ")"
+                   " ORDER BY e.updated_at DESC, e.id")
+            params = tuple(ids)
+        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
+    def list_tags_for_entries(self, entry_ids) -> dict:
+        """**批量**取多个条目的标签名（2026-09-14，性能优化：消除逐条查询的 N+1）。
+
+        返回 {entry_id: [标签名, ...]}（按标签名排序）；未传/空 → {}。
+        按 IN 分批（每批 500）以避开 SQLite 变量数量限制。
+        用途：条目区渲染时一次性预取标签（实测 100 条可省约 2 秒）。
+        """
+        ids = []
+        for x in (entry_ids or []):
+            try:
+                ids.append(int(x))
+            except (TypeError, ValueError):
+                continue
+        if not ids:
+            return {}
+        out = {}
+        for i in range(0, len(ids), 500):
+            batch = ids[i:i + 500]
+            ph = ",".join("?" * len(batch))
+            rows = self.conn.execute(
+                "SELECT et.entry_id AS eid, t.name AS name FROM entry_tags et"
+                " JOIN tags t ON t.id = et.tag_id"
+                " WHERE et.entry_id IN (" + ph + ")"
+                " ORDER BY et.entry_id, t.name", batch).fetchall()
+            for r in rows:
+                out.setdefault(r["eid"], []).append(r["name"])
+        return out
+
+    def set_entry_tags_bulk(self, assignments, mode: str = "append",
+                            touch_updated: bool = True,
+                            namespace: str = GLOBAL_TAG_NS) -> dict:
+        """批量写入"条目 → 标签名列表"（**单事务、幂等**）（2026-09-14 12:30，阶段 1）。
+
+        assignments: {entry_id: [标签名, ...]} 或 [(entry_id, [标签名, ...]), ...]
+        mode: "append"=并入既有标签（默认） / "replace"=替换该条目的全部标签
+        touch_updated: 是否刷新 entries.updated_at
+            - True（默认）：正常用户操作（改动应进当日变更包，与 P1-D 修复一致）；
+            - **False**：**预置数据初始化**（阶段 1 离线打标）——预置标签随库分发，
+              不应被当成"用户今日修改"而灌进当日变更包。
+        返回：{'entries': 处理条目数, 'links': 新增关联数, 'tags_created': 新建标签数}
+        """
+        items = list(assignments.items()) if isinstance(assignments, dict) \
+            else list(assignments or [])
+        items = [(int(eid), list(names or [])) for eid, names in items]
+        if not items:
+            return {"entries": 0, "links": 0, "tags_created": 0}
+
+        ts = _now()
+        # 1) 规范化 + 汇总全部标签名（跨条目去重、保持出现顺序）
+        norm, all_names, seen = [], [], set()
+        for eid, names in items:
+            cleaned = []
+            for n in names:
+                s = (n or "").strip()
+                if s and s not in cleaned:
+                    cleaned.append(s)
+                    if s not in seen:
+                        seen.add(s)
+                        all_names.append(s)
+            norm.append((eid, cleaned))
+
+        with self.conn:
+            # 2) 确保标签存在（幂等）
+            created, id_of = 0, {}
+            for s in all_names:
+                row = self.conn.execute(
+                    "SELECT id FROM tags WHERE namespace = ? AND name = ?",
+                    (namespace, s)).fetchone()
+                if row:
+                    id_of[s] = row["id"]
+                else:
+                    id_of[s] = self.conn.execute(
+                        "INSERT INTO tags(namespace, name, color, created_at, updated_at)"
+                        " VALUES(?,?,'',?,?)", (namespace, s, ts, ts)).lastrowid
+                    created += 1
+            # 3) 写关联（INSERT OR IGNORE → 重复执行不产生重复行）
+            links = 0
+            for eid, cleaned in norm:
+                if mode == "replace":
+                    self.conn.execute("DELETE FROM entry_tags WHERE entry_id = ?", (eid,))
+                for s in cleaned:
+                    cur = self.conn.execute(
+                        "INSERT OR IGNORE INTO entry_tags(entry_id, tag_id, created_at)"
+                        " VALUES(?,?,?)", (eid, id_of[s], ts))
+                    links += cur.rowcount or 0
+            # 4) 时间戳（预置数据初始化时不动，避免污染当日变更包）
+            if touch_updated:
+                for eid, _c in norm:
+                    self.conn.execute("UPDATE entries SET updated_at = ? WHERE id = ?", (ts, eid))
+        return {"entries": len(norm), "links": links, "tags_created": created}
+
+    # ------------------------------------------------------------------ #
+    # 热点词表（2026-09-14 11:15，阶段 4 之 4-a）
+    #   存于 meta 表（键 META_HOTWORDS / META_HOTWORD_SOURCES），值为 JSON 数组字符串
+    #   （**不新增数据库表、不改 schema 版本**，纯 meta 读写）。
+    #   用途：供"自动打标"的 ⑧ 热点词维度使用（命中即作为标签；每条例目最多取 1 个）。
+    #   与 tags 表无关：tags 是"已被使用过的标签"，热点词是"待匹配的词条库"。
+    # ------------------------------------------------------------------ #
+    HOTWORD_MAX_LEN = 24        # 单个词条最大长度（字符）；超长视为非法（防误导入整段文本）
+    HOTWORD_MAX_COUNT = 2000    # 词条总数上限（防误导入超大文件）
+
+    @staticmethod
+    def normalize_hotword(text) -> str:
+        """规范化单个热点词：去首尾空白 + 压缩内部连续空白；非法（空串/超长）返回 ""。
+
+        说明：**不做大小写统一**（中文无需；英文热点词保留用户原样，避免"Neon"被改成"neon"
+        后与用户预期不符），匹配阶段由引擎自行决定是否忽略大小写。
+        """
+        s = " ".join(str(text or "").split())
+        if not s or len(s) > Database.HOTWORD_MAX_LEN:
+            return ""
+        return s
+
+    @staticmethod
+    def parse_hotwords_text(text) -> List[str]:
+        """把"粘贴 / 导入的多行文本"解析为热点词列表（去重、丢弃非法项）。
+
+        分隔规则：换行 / 逗号（, ，）/ 顿号（、）/ 分号（; ；）/ 竖线（|）/ 制表符。
+        """
+        parts = re.split(r"[\r\n,，、;；|\t]+", str(text or ""))
+        out, seen = [], set()
+        for p in parts:
+            s = Database.normalize_hotword(p)
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    def list_hotwords(self) -> List[str]:
+        """读取热点词表（有序、已去重）。读不到 / 非法 JSON 时返回 []（不抛异常）。"""
+        raw = self.get_meta(META_HOTWORDS) or ""
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+        if not isinstance(data, list):
+            return []
+        out, seen = [], set()
+        for x in data:
+            s = self.normalize_hotword(x)
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    def count_hotwords(self) -> int:
+        """热点词条数（供界面显示）。"""
+        return len(self.list_hotwords())
+
+    def set_hotwords(self, words) -> int:
+        """**整体替换**热点词表（去重、丢弃非法项、截断到上限），返回写入条数。"""
+        return len(self.add_hotwords(words, replace=True)["total_list"])
+
+    def add_hotwords(self, words, replace: bool = False) -> dict:
+        """新增（默认**并集追加**，幂等）/ 整体替换热点词表。
+
+        返回：{'added': [新增词...], 'added_count': int, 'skipped': int（已存在或超上限）,
+               'invalid': int（空/超长被丢弃）, 'total': int（写入后总条数）,
+               'total_list': [写入后的完整词表]}
+        """
+        cur = [] if replace else self.list_hotwords()
+        have = set(cur)
+        added, skipped, invalid = [], 0, 0
+        for x in (words or []):
+            s = self.normalize_hotword(x)
+            if not s:
+                invalid += 1
+                continue
+            if s in have:
+                skipped += 1
+                continue
+            if len(cur) + len(added) >= self.HOTWORD_MAX_COUNT:
+                skipped += 1                     # 超出上限的词条计入"跳过"
+                continue
+            added.append(s)
+            have.add(s)
+        if added or replace:
+            self.set_meta(META_HOTWORDS, json.dumps(cur + added, ensure_ascii=False))
+        total_list = cur + added
+        return {"added": added, "added_count": len(added), "skipped": skipped,
+                "invalid": invalid, "total": len(total_list), "total_list": total_list}
+
+    def remove_hotwords(self, words) -> int:
+        """按名删除热点词（幂等），返回**实际删除条数**（不存在的不计）。"""
+        cur = self.list_hotwords()
+        targets = {self.normalize_hotword(x) for x in (words or [])}
+        targets.discard("")
+        if not targets:
+            return 0
+        keep = [w for w in cur if w not in targets]
+        removed = len(cur) - len(keep)
+        if removed:
+            self.set_meta(META_HOTWORDS, json.dumps(keep, ensure_ascii=False))
+        return removed
+
+    def list_hotword_sources(self) -> List[str]:
+        """读取"热点词来源网址"列表（仅保留 http/https、去重、按填写顺序）。"""
+        raw = self.get_meta(META_HOTWORD_SOURCES) or ""
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+        if not isinstance(data, list):
+            return []
+        out, seen = [], set()
+        for x in data:
+            s = str(x or "").strip()
+            if s and s.lower().startswith(("http://", "https://")) and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    def set_hotword_sources(self, urls) -> int:
+        """**整体替换**来源网址列表（仅保留 http/https、去重），返回写入条数。"""
+        out, seen = [], set()
+        for x in (urls or []):
+            s = str(x or "").strip()
+            if s and s.lower().startswith(("http://", "https://")) and s not in seen:
+                seen.add(s)
+                out.append(s)
+        self.set_meta(META_HOTWORD_SOURCES, json.dumps(out, ensure_ascii=False))
+        return len(out)
+
+    # ------------------------------------------------------------------ #
+    # 条目图集 entry_images（2026-09-13，第 2 期 2-a）
+    #   封面＝entries.image_path（既有行为完全不变）；本表只存"附加图"。
+    # ------------------------------------------------------------------ #
+    def list_entry_images(self, entry_id: int) -> List[dict]:
+        """列出某条目的附加图（按 sort_order, id）"""
+        rows = self.conn.execute(
+            "SELECT * FROM entry_images WHERE entry_id = ? ORDER BY sort_order, id",
+            (entry_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_entry_images(self, entry_id: int) -> int:
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM entry_images WHERE entry_id = ?", (entry_id,)).fetchone()[0]
+
+    def _gallery_next_index(self, entry_id: int) -> int:
+        """图集序号基数（用于 entry_{id}_{n}.{ext} 命名，避免与既有图集图重名）"""
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM entry_images WHERE entry_id = ?",
+            (entry_id,)).fetchone()
+        return int(row[0] or 0)
+
+    def add_entry_image(self, entry_id: int, kind: str = "local", path: str = "",
+                        source_url: str = "", caption: str = "") -> int:
+        """新增一张附加图（kind='local' 本地文件 / 'url' 外链），返回 id"""
+        if kind not in ("local", "url"):
+            raise ValueError("图片类型只能是 local 或 url")
+        if kind == "url" and not (source_url or "").strip():
+            raise ValueError("外链图片必须提供网址")
+        order = self._gallery_next_index(entry_id)
+        cur = self.conn.execute(
+            "INSERT INTO entry_images(entry_id, kind, path, source_url, is_primary,"
+            " sort_order, caption, created_at) VALUES(?,?,?,?,0,?,?,?)",
+            (entry_id, kind, path or "", source_url or "", order, caption or "", _now()))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def remove_entry_image(self, image_id: int, purge_file: bool = True) -> None:
+        """删除一张附加图（kind='local' 且 purge_file=True 时同步删除本地文件）"""
+        row = self.conn.execute(
+            "SELECT * FROM entry_images WHERE id = ?", (image_id,)).fetchone()
+        if row is None:
+            return
+        if purge_file and row["kind"] == "local" and row["path"]:
+            self._remove_image_file(row["path"])
+        self.conn.execute("DELETE FROM entry_images WHERE id = ?", (image_id,))
+        self.conn.commit()
+
+    def set_entry_image_local(self, image_id: int, path: str, source_url: str = "") -> None:
+        """把一张外链图登记为"已下载到本地"（kind→local；保留 source_url 以备追溯）"""
+        self.conn.execute(
+            "UPDATE entry_images SET kind = 'local', path = ?,"
+            " source_url = COALESCE(NULLIF(?, ''), source_url) WHERE id = ?",
+            (path or "", source_url or "", image_id))
+        self.conn.commit()
+
+    def gallery_file_rel(self, entry_id: int, ext: str) -> str:
+        """生成下一个图集本地文件名（相对 data/）：images/entry_{id}_{n}{ext}，保证不与在用文件冲突"""
+        used = {r["path"] for r in self.list_entry_images(entry_id) if r["path"]}
+        e = str(ext or "")
+        if e and not e.startswith("."):
+            e = "." + e
+        e = e or ".png"
+        n = self._gallery_next_index(entry_id)
+        while True:
+            rel = os.path.join(IMAGES_DIR_NAME, f"entry_{entry_id}_{n}{e}")
+            if rel not in used and not os.path.isfile(os.path.join(data_dir(), rel)):
+                return rel
+            n += 1
+
+    def swap_entry_image_order(self, entry_id: int, image_id: int, delta: int) -> bool:
+        """图集内上移/下移（只在本条目的附加图之间；越界返回 False）"""
+        ids = [r["id"] for r in self.list_entry_images(entry_id)]
+        if image_id not in ids:
+            return False
+        i = ids.index(image_id)
+        j = i + delta
+        if j < 0 or j >= len(ids):
+            return False
+        for k, rid in enumerate(ids):   # 先物化为 0..n-1，避免并列 sort_order 时交换无效
+            self.conn.execute("UPDATE entry_images SET sort_order = ? WHERE id = ?", (k, rid))
+        self.conn.execute("UPDATE entry_images SET sort_order = ? WHERE id = ?", (j, ids[i]))
+        self.conn.execute("UPDATE entry_images SET sort_order = ? WHERE id = ?", (i, ids[j]))
+        self.conn.commit()
+        return True
 
     def close(self) -> None:
         self.conn.close()
@@ -296,7 +1657,7 @@ class Database:
     # ------------------------------------------------------------------ #
     # 排序（2026-09-11 08:52 用户要求 2）：分类列"上移/下移"
     # ------------------------------------------------------------------ #
-    _ORDER_TABLES = ("projects", "domains", "categories")  # 允许重排的表白名单（防拼接外部输入）
+    _ORDER_TABLES = ("projects", "domains", "categories", "field_defs")  # 允许重排的表白名单（防拼接外部输入）
 
     def _order_value(self, table: str, row_id: int) -> int:
         """取某行的 sort_order（不存在时返回 0）"""
@@ -776,6 +2137,17 @@ class Database:
     # 条目 Entry
     # ------------------------------------------------------------------ #
     @staticmethod
+    def _entry_uuid_for(entry) -> str:
+        """取该条目的**稳定 ID**；为空则现场生成（2026-09-17，FR-93）。
+
+        - 普通新增：`Entry.uuid` 为空 ⇒ 自动分配；
+        - 导入 / 回收站恢复：`Entry.uuid` 已有值 ⇒ **沿用**（这正是"同一条目跨机器认人"的关键）；
+        - "复制到（独立副本）"与"分类子树深拷贝"：调用方会显式传**空串** ⇒ 分配新 ID（副本是新条目）。
+        """
+        _u = str(getattr(entry, "uuid", "") or "").strip()
+        return _u or new_entry_uuid()
+
+    @staticmethod
     def _entry_params(entry: Entry) -> tuple:
         return (
             entry.category_id, entry.name, entry.intro, entry.origin, entry.features,
@@ -785,11 +2157,15 @@ class Database:
 
     def add_entry(self, entry: Entry) -> int:
         ts = _now()
+        # 2026-09-16（批次 11-7，用户要求 3）：`Entry.created_at` 非空时**保留原创建时间**
+        #   （导入/恢复场景）；为空则仍取当前时间 ⇒ 普通新增行为**完全不变**。
+        ca = str(getattr(entry, "created_at", "") or "").strip() or ts
+        # 2026-09-17（FR-93）：稳定 ID —— 空则自动分配，已有则沿用（导入/恢复）
         cur = self.conn.execute(
             "INSERT INTO entries(category_id, name, intro, origin, features, scenes, works, "
             "image_desc, prompt_cn, prompt_en, image_plan, image_path, is_favorite, "
-            "created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (*self._entry_params(entry), ts, ts),
+            "created_at, updated_at, uuid) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (*self._entry_params(entry), ca, ts, self._entry_uuid_for(entry)),
         )
         self.conn.commit()
         return cur.lastrowid
@@ -798,13 +2174,18 @@ class Database:
         """批量插入条目（单事务提交，比逐条 add_entry 快；JSON/Excel 大文件导入用）。
 
         2026-08-18（P2-4 新增）：避免大文件导入时逐条 commit 的性能与碎片化开销。
+        2026-09-16（批次 11-7）：`Entry.created_at` 非空时保留原创建时间（导出→导入不丢）。
+        2026-09-17（FR-93）：每条写入稳定 ID（空则分配、已有则沿用）。
         """
         ts = _now()
         cols = ("category_id", "name", "intro", "origin", "features", "scenes", "works",
                 "image_desc", "prompt_cn", "prompt_en", "image_plan", "image_path",
-                "is_favorite", "created_at", "updated_at")
+                "is_favorite", "created_at", "updated_at", "uuid")
         ph = ",".join("?" * len(cols))
-        params = [(*self._entry_params(e), ts, ts) for e in entries]
+        params = [(*self._entry_params(e),
+                   str(getattr(e, "created_at", "") or "").strip() or ts, ts,
+                   self._entry_uuid_for(e))
+                  for e in entries]
         self.conn.executemany(
             f"INSERT INTO entries({', '.join(cols)}) VALUES({ph})", params)
         self.conn.commit()
@@ -831,6 +2212,8 @@ class Database:
         return "\x1f".join(parts)
 
     def update_entry(self, entry: Entry) -> None:
+        # 2026-09-17（FR-93）：**刻意不更新 uuid** —— 修改条目必须保持其稳定身份不变
+        #   （这正是"换机同步时'修改'能识别为同一条"的前提）。
         self.conn.execute(
             "UPDATE entries SET category_id = ?, name = ?, intro = ?, origin = ?, features = ?, "
             "scenes = ?, works = ?, image_desc = ?, prompt_cn = ?, prompt_en = ?, "
@@ -843,6 +2226,17 @@ class Database:
         row = self.conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
         return dict(row) if row else None
 
+    def get_entry_by_uuid(self, entry_uuid: str) -> Optional[dict]:
+        """按**稳定 ID** 取条目（2026-09-17，FR-93：导入 / 变更包"按 uuid 认人"用）。
+
+        空串 / 空值直接返回 None（空串不是有效身份）；不存在返回 None。
+        """
+        _u = str(entry_uuid or "").strip()
+        if not _u:
+            return None
+        row = self.conn.execute("SELECT * FROM entries WHERE uuid = ?", (_u,)).fetchone()
+        return dict(row) if row else None
+
     def delete_entry(self, entry_id: int, purge_image: bool = True) -> None:
         """物理删除条目（硬删除）。
 
@@ -851,6 +2245,11 @@ class Database:
         只有"回收站彻底删除/清空"时才 purge_image=True 释放图片。
         """
         entry = self.get_entry(entry_id)
+        if entry and purge_image:
+            # 2026-09-13（2-d）：彻底删除时同步释放图集本地文件（外链图无文件）
+            for _g in self.list_entry_images(entry_id):
+                if _g.get("kind") == "local" and _g.get("path"):
+                    self._remove_image_file(_g["path"])
         if entry and entry.get("image_path") and purge_image:
             self._remove_image_file(entry["image_path"])  # 同步删除关联图片（尽力而为）
         # 2026-08-29（增量备份增强）：记录删除日志，供换机同步删除
@@ -859,7 +2258,8 @@ class Database:
                 "entry", entry["name"],
                 chain=self._category_name_chain(entry["category_id"]) if entry.get("category_id") else [],
                 content_key=self.content_key(entry),
-                payload=json.dumps(dict(entry), ensure_ascii=False),  # V1.7.0：完整快照(⑤逆向恢复)
+                # V1.7.0：完整快照(⑤逆向恢复)；2026-09-13 起含自定义字段取值
+                payload=json.dumps(self.entry_snapshot(entry), ensure_ascii=False),
             )
         self.conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
         self.conn.commit()
@@ -869,6 +2269,30 @@ class Database:
     # 说明：deletion_log 只记"名字+内容键"用于换机增量同步；
     #       trash 保存完整内容快照，用于本机"恢复删除的条目"。
     # ------------------------------------------------------------------ #
+    def entry_snapshot(self, entry: dict) -> dict:
+        """条目"完整快照"：entries 行全部列 + 自定义字段取值 + 标签（2026-09-13，1-A-5 第 3 步·下 / 1-C-4）。
+
+        供"回收站快照"与"删除日志快照（变更包/⑤逆向恢复）"共用，确保自定义字段与标签都不丢。
+        无自定义字段/标签时仍写入空结构（结构稳定、便于判断）。
+        """
+        snap = dict(entry)
+        rows = self.list_entry_field_values(entry["id"])
+        snap["custom_fields"] = {r["field_key"]: r["value_text"] for r in rows}
+        # 2026-09-13（3-b）：结构化取值（目录层级型＝令牌+快照名）一并入快照，
+        # 使回收站恢复 / 变更包逆向恢复后引用不失效；无则**不写该键**（结构稳定且不膨胀）。
+        _thr = {r["field_key"]: r["value_json"] for r in rows if r["value_json"]}
+        if _thr:
+            snap["custom_fields_json"] = _thr
+        snap["tags"] = self.list_entry_tag_names(entry["id"])
+        # 2026-09-13（2-d）：图集一并入快照（回收站恢复/删除日志⑤逆向恢复都不丢多图）
+        snap["images"] = self.list_entry_images(entry["id"])
+        return snap
+
+    def list_entry_tag_names(self, entry_id: int,
+                             namespace: str = GLOBAL_TAG_NS) -> List[str]:
+        """某条目的标签名列表（按名称排序）——供快照/载荷/导出使用"""
+        return [t["name"] for t in self.list_entry_tags(entry_id, namespace)]
+
     def trash_entry(self, entry_id: int, reason: str = "手动删除") -> bool:
         """把条目移入回收站：完整快照入 trash → 硬删除（保留图片文件，便于恢复）。
 
@@ -877,7 +2301,7 @@ class Database:
         e = self.get_entry(entry_id)
         if not e:
             return False
-        payload = dict(e)
+        payload = self.entry_snapshot(e)   # 2026-09-13：快照含自定义字段取值
         payload["locations"] = self._entry_location_ids(entry_id)  # 全部位置（含主挂靠）
         payload["chain"] = (self._category_name_chain(e["category_id"])
                             if e.get("category_id") else [])
@@ -931,8 +2355,8 @@ class Database:
                 cur = self.conn.execute(
                     "INSERT INTO entries(category_id, name, intro, origin, features, scenes, "
                     "works, image_desc, prompt_cn, prompt_en, image_plan, image_path, "
-                    "is_favorite, created_at, updated_at) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "is_favorite, created_at, updated_at, uuid) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (main,
                      payload.get("name", row["name"]),
                      payload.get("intro", ""), payload.get("origin", ""),
@@ -941,12 +2365,52 @@ class Database:
                      payload.get("prompt_cn", ""), payload.get("prompt_en", ""),
                      payload.get("image_plan", ""), payload.get("image_path", ""),
                      1 if payload.get("is_favorite") else 0,
-                     payload.get("created_at") or now, now))
+                     payload.get("created_at") or now, now,
+                     # 2026-09-17（FR-93）：**沿用快照里的稳定 ID**（恢复后仍是"同一条目"）；
+                     # 老快照（v5 之前写入）没有 uuid ⇒ 现场分配一个。
+                     str(payload.get("uuid") or "").strip() or new_entry_uuid()))
                 new_id = cur.lastrowid
+                # 2026-09-13（1-A-5 第 3 步·下）：从回收站快照恢复自定义字段取值
+                # 2026-09-13（3-b）：结构化取值（目录层级型的令牌+快照名）同时恢复
+                _cfj = payload.get("custom_fields_json") or {}
+                for fk, v in (payload.get("custom_fields") or {}).items():
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO entry_field_values(entry_id, field_key,"
+                        " value_text, value_json, updated_at) VALUES(?, ?, ?, ?, ?)",
+                        (new_id, fk, v or "", _cfj.get(fk) or "", now))
+                # 2026-09-13（1-C-4）：从快照恢复标签（缺失标签自动创建）
+                for _n in (payload.get("tags") or []):
+                    _n = (_n or "").strip()
+                    if not _n:
+                        continue
+                    _row = self.conn.execute(
+                        "SELECT id FROM tags WHERE namespace = ? AND name = ?",
+                        (GLOBAL_TAG_NS, _n)).fetchone()
+                    if _row:
+                        _tid = _row["id"]
+                    else:
+                        _tid = self.conn.execute(
+                            "INSERT INTO tags(namespace, name, color, created_at, updated_at)"
+                            " VALUES(?,?,'',?,?)", (GLOBAL_TAG_NS, _n, now, now)).lastrowid
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO entry_tags(entry_id, tag_id, created_at)"
+                        " VALUES(?,?,?)", (new_id, _tid, now))
                 for cid in others:
                     self.conn.execute(
                         "INSERT OR IGNORE INTO entry_links(entry_id, category_id, created_at) "
                         "VALUES(?, ?, ?)", (new_id, cid, now))
+                # 2026-09-13（2-d）：从快照恢复图集（本地图文件在回收站期间被保留，直接重新挂回）
+                for _i, _g in enumerate(payload.get("images") or []):
+                    if not isinstance(_g, dict):
+                        continue
+                    _kind = _g.get("kind") if _g.get("kind") in ("local", "url") else "local"
+                    self.conn.execute(
+                        "INSERT INTO entry_images(entry_id, kind, path, source_url,"
+                        " is_primary, sort_order, caption, created_at)"
+                        " VALUES(?,?,?,?,0,?,?,?)",
+                        (new_id, _kind, _g.get("path") or "", _g.get("source_url") or "",
+                         _g.get("sort_order") if isinstance(_g.get("sort_order"), int) else _i,
+                         _g.get("caption") or "", _g.get("created_at") or now))
                 self.conn.execute("DELETE FROM trash WHERE id = ?", (trash_id,))
             return new_id
         except Exception:
@@ -969,6 +2433,11 @@ class Database:
         img = payload.get("image_path") if isinstance(payload, dict) else ""
         if img:
             self._remove_image_file(img)
+        # 2026-09-13（2-d）：彻底删除时同步释放快照中的图集本地文件
+        if isinstance(payload, dict):
+            for _g in (payload.get("images") or []):
+                if isinstance(_g, dict) and _g.get("kind") == "local" and _g.get("path"):
+                    self._remove_image_file(_g["path"])
         if isinstance(payload, dict) and payload:
             try:
                 key = self.content_key(payload)
@@ -990,6 +2459,13 @@ class Database:
                 img = payload.get("image_path") if isinstance(payload, dict) else ""
                 if img:
                     self._remove_image_file(img)
+                # 2026-09-14（审核修复 P1-B）：清空回收站时同步释放**图集**本地文件
+                # （此前只释放封面，清空后 entry_*_n.ext 成为永久孤儿文件）
+                if isinstance(payload, dict):
+                    for _g in (payload.get("images") or []):
+                        if (isinstance(_g, dict) and _g.get("kind") == "local"
+                                and _g.get("path")):
+                            self._remove_image_file(_g["path"])
                 if isinstance(payload, dict) and payload:
                     try:
                         key = self.content_key(payload)
@@ -1031,7 +2507,10 @@ class Database:
             e = self.get_entry(eid)
             if not e:
                 continue
-            payload = dict(e)
+            # 2026-09-14（审核修复 P1-A）：改与 trash_entry 同源的 entry_snapshot，
+            # 使"变更包删除同步"入站的条目也带自定义字段取值 / 标签 / 图集，
+            # 恢复不丢数据、彻底删除时图集文件也能被释放（此前用 dict(e)，三项全缺）。
+            payload = self.entry_snapshot(e)
             payload["locations"] = self._entry_location_ids(eid)
             payload["chain"] = (self._category_name_chain(e["category_id"])
                                 if e.get("category_id") else [])
@@ -1093,13 +2572,30 @@ class Database:
         except OSError:
             pass
 
-    def list_entries(self, category_id: int, include_descendants: bool = False) -> List[dict]:
+    # 条目区排序白名单（2026-09-16 批次 11-7，用户要求 3）：避免把用户输入拼进 SQL
+    _ENTRY_ORDER_SQL = {
+        "updated": "updated_at DESC, id",
+        "created": "created_at DESC, id DESC",
+        "name": "name COLLATE NOCASE ASC, id",
+    }
+
+    @classmethod
+    def entry_order_sql(cls, order_by: Optional[str] = None) -> str:
+        """条目排序 SQL 片段（**白名单**）：非法 / None ⇒ 默认"最后修改时间倒序"。"""
+        return cls._ENTRY_ORDER_SQL.get(order_by or "", cls._ENTRY_ORDER_SQL["updated"])
+
+    def list_entries(self, category_id: int, include_descendants: bool = False,
+                     order_by: Optional[str] = None) -> List[dict]:
         """列出某分类可见条目（主挂靠=该分类 ∪ 关联表含该分类，去重）。
 
         include_descendants=True 时含所有子分类子树内的可见条目。
         2026-09-07（条目多位置施工）：单分类列举由"只看 category_id"改为两路并集，
         使"关联到"的条目也能在对应分类下列出。
+        order_by（2026-09-16 批次 11-7，用户要求 3）：条目区排序方式，**白名单**取值——
+          None / "updated"（默认，最后修改时间倒序）/ "created"（新增时间倒序）/ "name"（名称升序）；
+          非法值一律回退默认 ⇒ 老调用方（不传）行为**完全不变**。
         """
+        _order = self.entry_order_sql(order_by)
         if include_descendants:
             ids = self._collect_category_ids(category_id)
             if not ids:
@@ -1111,7 +2607,7 @@ class Database:
                 " UNION "
                 f" SELECT e.* FROM entries e JOIN entry_links l ON l.entry_id = e.id"
                 f"  WHERE l.category_id IN ({ph})"
-                ") ORDER BY updated_at DESC, id",
+                f") ORDER BY {_order}",
                 ids + ids,
             ).fetchall()
         else:
@@ -1121,7 +2617,7 @@ class Database:
                 " UNION "
                 " SELECT e.* FROM entries e JOIN entry_links l ON l.entry_id = e.id"
                 "  WHERE l.category_id = ?"
-                ") ORDER BY updated_at DESC, id",
+                f") ORDER BY {_order}",
                 (category_id, category_id),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -1190,6 +2686,33 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # 2026-09-14（用户要求，"无标签条目"入口的数据层）：没有任何标签的条目。
+    #   与 list_uncategorized（无分类）对称；供「🏷 无标签条目」视图、标签页面入口
+    #   与搜索框 `#无标签` 语法共用，便于逐条为其打标签。
+    def list_untagged(self) -> List[dict]:
+        """列出**没有任何标签**的条目（按修改时间倒序）。"""
+        rows = self.conn.execute(
+            "SELECT * FROM entries WHERE id NOT IN "
+            "(SELECT DISTINCT entry_id FROM entry_tags) "
+            "ORDER BY updated_at DESC, id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_untagged(self) -> int:
+        """没有标签的条目数（供入口按钮显示数量）。
+
+        2026-09-15（审核 M-2，用户同意）：失败时**返回 −1 并打印一行日志**，不再静默 `return 0`——
+        原来"异常 → 0"会把"库被锁 / 损坏 / 缺表"伪装成"确实没有无标签条目"，
+        UI 随之显示"（0）"而掩盖故障；UI 侧对 −1 显示"未知"。
+        """
+        try:
+            return self.conn.execute(
+                "SELECT COUNT(*) FROM entries WHERE id NOT IN "
+                "(SELECT DISTINCT entry_id FROM entry_tags)").fetchone()[0]
+        except Exception as exc:                    # 2026-09-15（审核 M-2）：不再吞异常返回 0
+            print(f"[无标签条目] 计数失败（返回 -1 表示未知）：{exc}")
+            return -1
+
     def list_all_entries(self) -> List[dict]:
         rows = self.conn.execute("SELECT * FROM entries ORDER BY id").fetchall()
         return [dict(r) for r in rows]
@@ -1214,6 +2737,8 @@ class Database:
 
         2026-08-18（第020条，P2-B1 修复）：对 LIKE 通配符 % / _ 做转义（ESCAPE '\\'），
         使搜索含 % 或 _ 的关键词按字面匹配，避免意外通配匹配到多余结果。
+        2026-09-13（schema v4，第 1 期 1-A）：追加匹配"自定义字段取值"
+        （entry_field_values.value_text），内置 10 字段的匹配逻辑与排序保持不变。
         """
         # 转义顺序：先转义反斜杠自身，再转义 % 与 _（ESCAPE 字符为反斜杠）
         escaped = keyword.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -1224,8 +2749,12 @@ class Database:
             "OR origin LIKE ?" + esc + "OR features LIKE ?" + esc + "OR scenes LIKE ?" + esc +
             "OR works LIKE ?" + esc + "OR image_desc LIKE ?" + esc + "OR prompt_cn LIKE ?" + esc +
             "OR prompt_en LIKE ?" + esc + "OR image_plan LIKE ?" + esc +
+            "OR EXISTS (SELECT 1 FROM entry_field_values v"
+            "           WHERE v.entry_id = entries.id AND v.value_text LIKE ?" + esc + ") " +
+            "OR EXISTS (SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id"
+            "           WHERE et.entry_id = entries.id AND t.name LIKE ?" + esc + ") " +
             "ORDER BY updated_at DESC, id",
-            (kw,) * 10,
+            (kw,) * 12,
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -1342,25 +2871,60 @@ class Database:
                 cur = self.conn.execute(
                     "INSERT INTO entries(category_id, name, intro, origin, features, scenes, "
                     "works, image_desc, prompt_cn, prompt_en, image_plan, image_path, "
-                    "is_favorite, created_at, updated_at) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "is_favorite, created_at, updated_at, uuid) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (target_cat_id, name, e["intro"], e["origin"], e["features"],
                      e["scenes"], e["works"], e["image_desc"], e["prompt_cn"],
-                     e["prompt_en"], e["image_plan"], e["image_path"], 0, ts, ts))
+                     e["prompt_en"], e["image_plan"], e["image_path"], 0, ts, ts,
+                     # 2026-09-17（FR-93）：**复制到 = 独立副本** ⇒ 分配**新**稳定 ID
+                     #   （不可沿用原条目 uuid，否则跨机器会被误认成"同一条目"）。
+                     new_entry_uuid()))
                 new_id = cur.lastrowid
+                # 2026-09-13（1-A-5 第 3 步·下）：自定义字段取值一并复制（独立副本）
+                for r in self.conn.execute(
+                        "SELECT field_key, value_text, value_json FROM entry_field_values"
+                        " WHERE entry_id = ?", (entry_id,)):
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO entry_field_values(entry_id, field_key,"
+                        " value_text, value_json, updated_at) VALUES(?, ?, ?, ?, ?)",
+                        (new_id, r["field_key"], r["value_text"], r["value_json"], ts))
+                # 2026-09-13（1-C-4）：标签一并复制（独立副本共用同一批标签对象）
+                for r in self.conn.execute(
+                        "SELECT tag_id FROM entry_tags WHERE entry_id = ?", (entry_id,)):
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO entry_tags(entry_id, tag_id, created_at)"
+                        " VALUES(?, ?, ?)", (new_id, r["tag_id"], ts))
                 if e.get("image_path"):
                     new_rel = self._copy_image_file(e["image_path"], new_id)
                     if new_rel:
                         self.conn.execute(
                             "UPDATE entries SET image_path = ? WHERE id = ?",
                             (new_rel, new_id))
+                # 2026-09-13（2-d）：图集一并复制（本地图复制为新文件，避免删一份误删另一份）
+                for _i, _g in enumerate(self.list_entry_images(entry_id)):
+                    if _g.get("kind") == "url":
+                        self.conn.execute(
+                            "INSERT INTO entry_images(entry_id, kind, path, source_url,"
+                            " is_primary, sort_order, caption, created_at)"
+                            " VALUES(?,?,?,?,0,?,?,?)",
+                            (new_id, "url", "", _g.get("source_url") or "", _i,
+                             _g.get("caption") or "", ts))
+                        continue
+                    _rel = self._copy_gallery_file(_g.get("path") or "", new_id, _i)
+                    if _rel:
+                        self.conn.execute(
+                            "INSERT INTO entry_images(entry_id, kind, path, source_url,"
+                            " is_primary, sort_order, caption, created_at)"
+                            " VALUES(?,?,?,?,0,?,?,?)",
+                            (new_id, "local", _rel, _g.get("source_url") or "", _i,
+                             _g.get("caption") or "", ts))
             return new_id
         except Exception:
             self.conn.rollback()
             raise
 
     def _copy_image_file(self, old_rel: str, new_entry_id: int) -> Optional[str]:
-        """复制条目图片到新条目名下（相对 data/ 路径安全校验；失败返回 None）"""
+        """复制条目封面图片到新条目名下（相对 data/ 路径安全校验；失败返回 None）"""
         try:
             root = os.path.abspath(data_dir())
             src = os.path.abspath(os.path.join(root, old_rel))
@@ -1370,6 +2934,25 @@ class Database:
             img_dir = os.path.join(root, IMAGES_DIR_NAME)
             os.makedirs(img_dir, exist_ok=True)
             dest_rel = os.path.join(IMAGES_DIR_NAME, f"entry_{new_entry_id}{ext}")
+            shutil.copy2(src, os.path.join(root, dest_rel))
+            return dest_rel
+        except (OSError, ValueError):
+            return None
+
+    def _copy_gallery_file(self, old_rel: str, new_entry_id: int,
+                           idx: int) -> Optional[str]:
+        """复制图集本地图到新条目名下：images/entry_{新id}_{序号}{ext}（失败返回 None）"""
+        if not old_rel:
+            return None
+        try:
+            root = os.path.abspath(data_dir())
+            src = os.path.abspath(os.path.join(root, old_rel))
+            if os.path.commonpath([root, src]) != root or not os.path.isfile(src):
+                return None
+            ext = os.path.splitext(old_rel)[1] or ""
+            img_dir = os.path.join(root, IMAGES_DIR_NAME)
+            os.makedirs(img_dir, exist_ok=True)
+            dest_rel = os.path.join(IMAGES_DIR_NAME, f"entry_{new_entry_id}_{idx}{ext}")
             shutil.copy2(src, os.path.join(root, dest_rel))
             return dest_rel
         except (OSError, ValueError):
@@ -1484,6 +3067,235 @@ class Database:
             self.conn.rollback()
             raise
 
+    # ------------------------------------------------------------------ #
+    # 批量删除（2026-09-22，用户要求 3-2：按 项目类别/根目录/分类 批量删除本分支全部数据）
+    #
+    #   背景：原先删除只能针对"分类（categories）"层级，数据量大时逐项删除体验差。
+    #   本段提供数据层能力；删除前的两份备份（全量库快照 + 分支 JSON 导出）由 UI 层完成，
+    #   数据层只负责"按方案执行"，并做兜底校验（短语 / 口令）防误删。
+    #
+    #   两条既定口径（2026-09-22 用户决策）：
+    #     ① 条目处置（决策 5）：**只有该条目的全部位置都落在本次删除范围内**，才处置
+    #        条目本体；只要还有位置在范围之外，就仅删除范围内的位置关联，条目本体保留
+    #        （其他分支仍可访问）。
+    #     ② 结构处置（决策：独占删除、共享保留）：一级分类与根目录是多对多
+    #        （domain_category）。删除某根目录/项目类别时，**仍被范围外根目录关联的
+    #        一级分类记录保留**，仅靠删除域记录时外键级联解除关联；只有"仅在范围内"
+    #        的一级分类才连同其子树一起删除。
+    #
+    #   注：本段全是**新增**方法，不改动既有 delete_category_cascade / delete_domain /
+    #       delete_project 的行为，确保既有右键菜单流程零影响。
+    # ------------------------------------------------------------------ #
+    # 批量删除"项目类别"层级的专用口令（2026-09-22 用户决策 3：更高级别确认；
+    #   该口令是公开默认值，作用是"多一道手工关卡"，真正的兜底是双备份 + 回收站）
+    _BATCH_DELETE_PASSPHRASE = "123456"
+
+    def _l1_domain_links(self) -> dict:
+        """全部一级分类 → 关联到的根目录 id 集合（用于判断"独占 / 共享"）"""
+        rows = self.conn.execute(
+            "SELECT dc.category_id AS cid, dc.domain_id AS did "
+            "FROM domain_category dc JOIN categories c ON c.id = dc.category_id "
+            "WHERE c.parent_id IS NULL"
+        ).fetchall()
+        out = {}
+        for r in rows:
+            out.setdefault(r["cid"], set()).add(r["did"])
+        return out
+
+    def _batch_delete_plan(self, kind: str, scope_id: int) -> Optional[dict]:
+        """批量删除方案（**只读**，不修改任何数据）；返回 None 表示目标不存在。
+
+        kind：'cat'（一级/二级分类）/ 'domain'（根目录）/ 'project'（项目类别）
+        返回字段：
+          title          分支名称（供 UI 显示）
+          scope_cats     将被删除的分类记录 id（含全部子分类）
+          l1_delete      将被删除记录的一级分类 id
+          l1_shared      共享保留（仅解除关联）的一级分类 id
+          domain_delete  将被删除的根目录 id
+          project_delete 将被删除的项目类别 id（或 None）
+          entries_purge  将被处置本体的条目 id（全部位置都在范围内）
+          entries_unlink [(条目 id, [范围内应移除的位置分类 id]), …]
+        """
+        plan = {
+            "kind": kind, "scope_id": scope_id, "title": "",
+            "scope_cats": [], "l1_delete": [], "l1_shared": [],
+            "domain_delete": [], "project_delete": None,
+            "entries_purge": [], "entries_unlink": [],
+        }
+        if kind == "cat":
+            c = self.get_category(scope_id)
+            if not c:
+                return None
+            plan["title"] = c["name"]
+            plan["scope_cats"] = self._collect_category_ids(scope_id)
+        elif kind == "domain":
+            d = self.get_domain(scope_id)
+            if not d:
+                return None
+            plan["title"] = d["name"]
+            plan["domain_delete"] = [scope_id]
+            scope_domains = {scope_id}
+            links = self._l1_domain_links()
+            for cid in sorted(cid for cid, doms in links.items() if scope_id in doms):
+                if links[cid] <= scope_domains:
+                    plan["l1_delete"].append(cid)
+                else:
+                    plan["l1_shared"].append(cid)   # 共享：分类记录保留，删域记录时级联解除关联
+            for cid in plan["l1_delete"]:
+                plan["scope_cats"].extend(self._collect_category_ids(cid))
+        elif kind == "project":
+            p = self.get_project(scope_id)
+            if not p:
+                return None
+            plan["title"] = p["name"]
+            plan["project_delete"] = scope_id
+            plan["domain_delete"] = [d["id"] for d in self.list_domains(project_id=scope_id)]
+            scope_domains = set(plan["domain_delete"])
+            links = self._l1_domain_links()
+            for cid in sorted(cid for cid, doms in links.items() if doms & scope_domains):
+                if links[cid] <= scope_domains:
+                    plan["l1_delete"].append(cid)
+                else:
+                    plan["l1_shared"].append(cid)
+            for cid in plan["l1_delete"]:
+                plan["scope_cats"].extend(self._collect_category_ids(cid))
+        else:
+            raise ValueError(f"未知的批量删除层级：{kind}")
+
+        # 条目处置：范围内涉及的条目逐个判断"是否全部位置都在范围内"
+        if plan["scope_cats"]:
+            ids = plan["scope_cats"]
+            ph = ",".join("?" * len(ids))
+            rows = self.conn.execute(
+                "SELECT e.id AS id FROM entries e WHERE e.category_id IN (" + ph + ")"
+                " UNION "
+                "SELECT l.entry_id AS id FROM entry_links l WHERE l.category_id IN (" + ph + ")",
+                ids + ids,
+            ).fetchall()
+            for r in rows:
+                eid = r["id"]
+                locs = self._entry_location_ids(eid)
+                in_scope = [c for c in locs if c in set(ids)]
+                if len(in_scope) == len(locs):     # 全部位置都在范围内 → 处置本体
+                    plan["entries_purge"].append(eid)
+                elif in_scope:                     # 范围外仍有位置 → 只解除范围内的位置
+                    plan["entries_unlink"].append((eid, in_scope))
+        return plan
+
+    def count_scope_items(self, kind: str, scope_id: int) -> dict:
+        """批量删除影响面统计（**只读**，供 UI 确认弹窗）。
+
+        返回 {'exists', 'title', 'categories', 'l1_shared', 'domains', 'projects',
+              'entries_purge', 'entries_unlink', 'entries', 'images'}
+          categories     将被删除的分类记录数（含子分类）
+          l1_shared      共享保留、仅解除关联的一级分类数
+          entries_purge  将被处置本体的条目数（全部位置都在范围内）
+          entries_unlink 仅解除位置关联的条目数（范围外仍有位置，条目本体保留）
+          images         将被释放的图片数（仅"硬删除"才真正删除图片文件）
+        """
+        plan = self._batch_delete_plan(kind, scope_id)
+        if plan is None:
+            return {"exists": False, "title": ""}
+        purge = plan["entries_purge"]
+        images = 0
+        if purge:
+            ph = ",".join("?" * len(purge))
+            images = self.conn.execute(
+                "SELECT COUNT(*) FROM entry_images WHERE entry_id IN (" + ph + ")",
+                purge).fetchone()[0]
+            images += self.conn.execute(
+                "SELECT COUNT(*) FROM entries WHERE id IN (" + ph + ")"
+                " AND image_path IS NOT NULL AND image_path <> ''", purge).fetchone()[0]
+        return {
+            "exists": True,
+            "title": plan["title"],
+            "categories": len(plan["scope_cats"]),
+            "l1_shared": len(plan["l1_shared"]),
+            "domains": len(plan["domain_delete"]),
+            "projects": 1 if plan["project_delete"] else 0,
+            "entries_purge": len(purge),
+            "entries_unlink": len(plan["entries_unlink"]),
+            "entries": len(purge) + len(plan["entries_unlink"]),
+            "images": images,
+        }
+
+    def delete_scope_cascade(self, kind: str, scope_id: int, confirm_phrase: str,
+                             passphrase: Optional[str] = None,
+                             mode: str = "soft") -> dict:
+        """按分支批量删除（**破坏性**；数据层兜底校验，UI 层另有多重确认）。
+
+        kind：'cat' / 'domain' / 'project'
+        mode：'soft'（条目本体移入回收站，可恢复）/ 'hard'（条目本体彻底删除并释放图片）
+        passphrase：仅 kind='project' 需要（更高级别确认，见用户决策 3）
+
+        返回 {'categories','domains','projects','entries_purge','entries_unlink'}。
+        """
+        if confirm_phrase != self._CASCADE_PHRASE:
+            raise ValueError("确认短语不正确，已取消批量删除")
+        if kind == "project" and passphrase != self._BATCH_DELETE_PASSPHRASE:
+            raise ValueError("口令不正确，已取消批量删除")
+        if mode not in ("soft", "hard"):
+            raise ValueError(f"未知的删除方式：{mode}")
+        plan = self._batch_delete_plan(kind, scope_id)
+        if plan is None:
+            raise ValueError("目标不存在，无法批量删除")
+        try:
+            # 1) 只解除位置关联的条目（范围外仍有位置 → 本体保留）
+            for eid, cids in plan["entries_unlink"]:
+                with self.conn:
+                    self._entry_location_apply_tx(eid, remove=cids, add=[])
+            # 2) 处置本体的条目（全部位置都在范围内）
+            for eid in plan["entries_purge"]:
+                if mode == "soft":
+                    self.trash_entry(eid, reason="批量删除")
+                else:
+                    self.delete_entry(eid, purge_image=True)
+            # 3) 删除分类结构（含子树；entry_links 由外键 ON DELETE CASCADE 自动清除）
+            ids = plan["scope_cats"]
+            if ids:
+                for cid in ids:
+                    c = self.get_category(cid)
+                    if c:
+                        self._log_deletion("category", c["name"],
+                                           chain=self._category_name_chain(cid))
+                ph = ",".join("?" * len(ids))
+                self.conn.execute("DELETE FROM categories WHERE id IN (" + ph + ")", ids)
+            # 4) 删除根目录记录（domain_category 关联由外键 ON DELETE CASCADE 自动解除）
+            for did in plan["domain_delete"]:
+                d = self.get_domain(did)
+                if d:
+                    self._log_deletion("domain", d["name"])
+                self.conn.execute("DELETE FROM domains WHERE id = ?", (did,))
+            # 5) 删除项目类别记录
+            if plan["project_delete"]:
+                p = self.get_project(plan["project_delete"])
+                if p:
+                    self._log_deletion("project", p["name"])
+                self.conn.execute("DELETE FROM projects WHERE id = ?",
+                                  (plan["project_delete"],))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return {
+            "categories": len(plan["scope_cats"]),
+            "domains": len(plan["domain_delete"]),
+            "projects": 1 if plan["project_delete"] else 0,
+            "entries_purge": len(plan["entries_purge"]),
+            "entries_unlink": len(plan["entries_unlink"]),
+        }
+
+    def delete_domain_cascade(self, domain_id: int, confirm_phrase: str,
+                              mode: str = "soft") -> dict:
+        """批量删除某根目录下的全部数据（独占分类删除、共享分类保留）"""
+        return self.delete_scope_cascade("domain", domain_id, confirm_phrase, mode=mode)
+
+    def delete_project_cascade(self, project_id: int, confirm_phrase: str,
+                               passphrase: str, mode: str = "soft") -> dict:
+        """批量删除某项目类别下的全部数据（需 确认短语 + 专用口令 双重兜底）"""
+        return self.delete_scope_cascade("project", project_id, confirm_phrase,
+                                         passphrase=passphrase, mode=mode)
+
     def toggle_favorite(self, entry_id: int) -> int:
         """切换收藏状态，返回新状态(0/1)"""
         self.conn.execute(
@@ -1590,19 +3402,60 @@ class Database:
             )
         return cid
 
+    def _copy_aux_tx(self, src_id: int, new_id: int, ts: str) -> None:
+        """事务内复制条目的"附加数据"：自定义字段取值 + 标签关联 + 图集（2-d，不 commit）。
+
+        - 图集本地图复制为独立新文件（避免删一份误删另一份）；外链图直接复制记录；
+        - 封面（entries.image_path）沿用既有"引用同一文件"策略，不在本方法处理。
+        """
+        for r in self.conn.execute(
+                "SELECT field_key, value_text, value_json FROM entry_field_values"
+                " WHERE entry_id = ?", (src_id,)):
+            self.conn.execute(
+                "INSERT OR REPLACE INTO entry_field_values(entry_id, field_key,"
+                " value_text, value_json, updated_at) VALUES(?, ?, ?, ?, ?)",
+                (new_id, r["field_key"], r["value_text"], r["value_json"], ts))
+        for r in self.conn.execute(
+                "SELECT tag_id FROM entry_tags WHERE entry_id = ?", (src_id,)):
+            self.conn.execute(
+                "INSERT OR IGNORE INTO entry_tags(entry_id, tag_id, created_at)"
+                " VALUES(?, ?, ?)", (new_id, r["tag_id"], ts))
+        for _i, _g in enumerate(self.list_entry_images(src_id)):
+            if _g.get("kind") == "url":
+                self.conn.execute(
+                    "INSERT INTO entry_images(entry_id, kind, path, source_url,"
+                    " is_primary, sort_order, caption, created_at) VALUES(?,?,?,?,0,?,?,?)",
+                    (new_id, "url", "", _g.get("source_url") or "", _i,
+                     _g.get("caption") or "", ts))
+                continue
+            _rel = self._copy_gallery_file(_g.get("path") or "", new_id, _i)
+            if _rel:
+                self.conn.execute(
+                    "INSERT INTO entry_images(entry_id, kind, path, source_url,"
+                    " is_primary, sort_order, caption, created_at) VALUES(?,?,?,?,0,?,?,?)",
+                    (new_id, "local", _rel, _g.get("source_url") or "", _i,
+                     _g.get("caption") or "", ts))
+
     def _copy_subtree_tx(self, src_id: int, new_parent_id: Optional[int], new_name: str,
                          new_domain_id: Optional[int] = None) -> int:
-        """事务内深拷贝分类子树（含条目；条目图片引用同一文件，不 commit）。返回新分类 id"""
+        """事务内深拷贝分类子树（含条目；条目封面引用同一文件，不 commit）。返回新分类 id
+
+        2026-09-13（2-d）：条目副本一并复制**自定义字段取值、标签关联与图集**
+        （此前遗漏；标签为 V2 定案"复制分类子树时标签一并复制"）。
+        """
         cid = self._insert_category_tx(new_parent_id, new_name, new_domain_id)
         ts = _now()
         for e in self.list_entries(src_id):
-            entry = Entry(**{**e, "id": None, "category_id": cid})
-            self.conn.execute(
+            # 2026-09-17（FR-93）：分类子树深拷贝产出的是**独立副本** ⇒ uuid 置空以分配**新** ID
+            #   （不可沿用原条目的 uuid，否则跨机器会被误认成"同一条目"）。
+            entry = Entry(**{**e, "id": None, "category_id": cid, "uuid": ""})
+            cur = self.conn.execute(
                 "INSERT INTO entries(category_id, name, intro, origin, features, scenes, works, "
                 "image_desc, prompt_cn, prompt_en, image_plan, image_path, is_favorite, "
-                "created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (*self._entry_params(entry), ts, ts),
+                "created_at, updated_at, uuid) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (*self._entry_params(entry), ts, ts, new_entry_uuid()),
             )
+            self._copy_aux_tx(e["id"], cur.lastrowid, ts)
         for child in self.list_categories(parent_id=src_id):
             self._copy_subtree_tx(child["id"], cid, child["name"])
         return cid
@@ -2318,6 +4171,34 @@ def _selftest() -> None:
         assert db.get_entry(e_in2) is None
         print("[30] 分类删除保护：安全删除/级联短语 通过")
 
+        # 31. 条目排序白名单 + 创建时间保真（2026-09-16 批次 11-7，用户要求 3）
+        assert Database.entry_order_sql(None) == "updated_at DESC, id"
+        assert Database.entry_order_sql("坏值; DROP TABLE") == "updated_at DESC, id", "非法值须回退默认"
+        assert "created_at" in Database.entry_order_sql("created")
+        assert "name" in Database.entry_order_sql("name")
+        _did31 = db.add_domain("排序测试根")
+        _cid31 = db.add_category("排序测试类", domain_id=_did31)
+        _eid_old = db.add_entry(Entry(category_id=_cid31, name="排序-1",
+                                      created_at="2001-01-01 00:00:00"))
+        _eid_new = db.add_entry(Entry(category_id=_cid31, name="排序-2"))
+        assert db.get_entry(_eid_old)["created_at"] == "2001-01-01 00:00:00", \
+            "Entry.created_at 非空时须保留（导入/恢复不丢时间）"
+        _ca_new = db.get_entry(_eid_new)["created_at"]
+        assert _ca_new and _ca_new != "2001-01-01 00:00:00", "未指定时仍取当前时间"
+        _by_created = [x["name"] for x in db.list_entries(_cid31, order_by="created")]
+        assert _by_created == ["排序-2", "排序-1"], _by_created         # 新增时间倒序（新的在前）
+        _by_name = [x["name"] for x in db.list_entries(_cid31, order_by="name")]
+        assert _by_name == ["排序-1", "排序-2"], _by_name               # 名称升序
+        assert len(db.list_entries(_cid31, order_by="怪值")) == 2       # 非法排序不报错
+        # 批量插入同样保留 created_at
+        _n31 = db.add_entries_batch([Entry(category_id=_cid31, name="排序-3",
+                                           created_at="2002-02-02 00:00:00")])
+        assert _n31 == 1
+        _c31 = [x for x in db.list_entries(_cid31, order_by="created")
+                if x["name"] == "排序-3"]
+        assert _c31 and _c31[0]["created_at"] == "2002-02-02 00:00:00", _c31
+        print("[31] 条目排序白名单/创建时间保真 通过")
+
         print(f"[统计] {db.stats()}")
         print("=== 数据库层全部自测通过 ===")
     finally:
@@ -2358,12 +4239,29 @@ def _migrate_selftest() -> None:
         conn.commit()
         conn.close()
 
-        db = Database(v2)  # 触发结构迁移 v2→v3
+        _u = ""   # 迁移后第 1 条的 uuid（供"重开幂等"断言比对；提前初始化避免掩盖真实错误）
+        db = Database(v2)  # 触发结构迁移 v2→v3→v4→v5
         try:
-            assert db.get_meta("schema_version") == "3"
+            assert db.get_meta("schema_version") == "5"
             assert db._has_column("domains", "project_id")
             assert len(db.list_projects()) == 5
             assert db.get_entry(1)["name"] == "迁移条目"  # 数据无损
+            # v3→v4：五表建成 + 内置 10 字段预置
+            for t in ("field_defs", "entry_field_values", "entry_ref_links",
+                      "tags", "entry_tags"):
+                assert db.conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+                    (t,)).fetchone()[0] == 1, t
+            assert len(db.list_field_defs()) == 13  # 2026-09-16：10 内置 + 3 虚拟区块
+            # v4→v5（2026-09-17，FR-93）：entries 补 uuid 列 + 回填 + 部分唯一索引
+            assert db._has_column("entries", "uuid")
+            _u = db.get_entry(1)["uuid"]
+            assert _u and len(_u) == 32, _u                     # 老条目已被回填
+            assert db.conn.execute(
+                "SELECT COUNT(*) FROM entries WHERE uuid IS NULL OR uuid=''").fetchone()[0] == 0
+            assert db.conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index'"
+                " AND name='idx_entries_uuid'").fetchone()[0] == 1
             # 归属分配：全命中 + 未知根目录未回答 → 兜底"未明确分类"
             st = db.assign_domains_to_projects(PROJECT_DOMAIN_MAPPING)
             assert st["matched"] == 2, st
@@ -2375,21 +4273,711 @@ def _migrate_selftest() -> None:
             # 幂等：重跑不再产生变化
             st2 = db.assign_domains_to_projects({}, None)
             assert st2 == {"matched": 0, "unmatched": 0, "fallback": 0}, st2
-            print("[迁移] v2→v3 结构升级/归属分配/兜底/幂等 通过")
+            print("[迁移] v2→v5 结构升级/字段预置/uuid回填/归属分配/兜底/幂等 通过")
         finally:
             db.close()
-        # 幂等：重开库不再重复迁移
+        # 幂等：重开库不再重复迁移（uuid 保持不变）
         db2 = Database(v2)
         try:
-            assert db2.get_meta("schema_version") == "3"
+            assert db2.get_meta("schema_version") == "5"
+            assert db2.get_entry(1)["uuid"] == _u                   # 重开不改 uuid
             assert len(db2.list_projects()) == 6  # 5 预置 + 未明确分类
-            print("[迁移] 重开幂等 通过")
+            assert len(db2.list_field_defs()) == 13  # 2026-09-16：10 内置 + 3 虚拟（迁移后补齐）
+            print("[迁移] 重开幂等（含 uuid 不变）通过")
         finally:
             db2.close()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _fields_selftest() -> None:
+    """字段定义（第 1 期地基；2026-09-17 起库结构为 v5）自测：预置/读取/改名/幂等/不重复预置。"""
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="promptsprite_fields_")
+    try:
+        p = os.path.join(tmp, "fields.db")
+        db = Database(p)
+        try:
+            assert db.get_meta("schema_version") == "5"
+            defs = db.list_field_defs()
+            assert len(defs) == 13, len(defs)  # 2026-09-16：10 内置 + 3 虚拟区块
+            # 顺序：虚拟区块（sort_order 负）→ name → ②~⑩
+            assert [d["field_key"] for d in defs] == [
+                "_location", "_time", "_tags",
+                "name", "intro", "origin", "features", "scenes",
+                "works", "image_desc", "prompt_cn", "prompt_en", "image_plan"]
+            # 13 项均为内置、不可删除（is_builtin=1）
+            assert all(d["is_builtin"] == 1 for d in defs)
+            # 类型：① 短文本；⑧⑨ 长文本；⑩ 链接
+            assert db.get_field_def("name")["field_type"] == "text"
+            assert db.get_field_def("prompt_cn")["field_type"] == "textarea"
+            assert db.get_field_def("image_plan")["field_type"] == "link"
+            # 改名：只改显示名，field_key 不变
+            db.rename_field_def("image_desc", "⑦ 高清配图（改名测试）")
+            assert db.get_field_def("image_desc")["display_name"] == "⑦ 高清配图（改名测试）"
+            assert db.get_field_def("image_desc")["field_key"] == "image_desc"
+            # 重开幂等：不重复预置，改名保留
+            db.close()
+            db = Database(p)
+            assert len(db.list_field_defs()) == 13  # 2026-09-16：10 内置 + 3 虚拟区块
+            assert db.get_field_def("image_desc")["display_name"] == "⑦ 高清配图（改名测试）"
+            assert db.get_field_def("__no_such__") is None
+            print("[字段] schema v4 预置/类型/改名/幂等 通过")
+            # ---- 1-A-5 第 1 步：新增自定义字段 ----
+            assert db.add_field_def("作者", "text") == "custom_1"
+            assert db.add_field_def("发布日期", "date") == "custom_2"
+            defs2 = db.list_field_defs()
+            assert len(defs2) == 15, len(defs2)  # 2026-09-16：13 预置 + 2 自定义
+            assert defs2[-1]["field_key"] == "custom_2"    # 追加到末尾
+            assert defs2[-1]["is_builtin"] == 0            # 自定义字段
+            assert db.get_field_def("custom_1")["field_type"] == "text"
+            for bad in (("坏类型", "unknown"), ("   ", "text")):   # 非法类型 / 空名
+                try:
+                    db.add_field_def(*bad)
+                    raise SystemExit(f"应拒绝：{bad}")
+                except ValueError:
+                    pass
+            # 重开：自定义字段与改名均保留，且键不重复
+            db.close()
+            db = Database(p)
+            assert len(db.list_field_defs()) == 15  # 2026-09-16：13 预置 + 2 自定义
+            assert db.add_field_def("第三个", "textarea") == "custom_3"
+            print("[字段] 新增自定义字段（键生成/类型校验/末尾追加/持久化）通过")
+            # ---- 1-A-5 第 3 步（上）：归档/恢复 + 自定义字段排序 ----
+            assert db.get_field_def("custom_1")["archived"] == 0
+            db.archive_field_def("custom_1")
+            assert db.get_field_def("custom_1")["archived"] == 1
+            assert "custom_1" not in [d["field_key"] for d in db.list_field_defs()]
+            assert "custom_1" in [d["field_key"]
+                                  for d in db.list_field_defs(include_archived=True)]
+            db.restore_field_def("custom_1")
+            assert db.get_field_def("custom_1")["archived"] == 0
+            for bad in ("intro", "name"):      # 内置字段不可归档
+                try:
+                    db.archive_field_def(bad)
+                    raise SystemExit(f"内置字段不应可归档：{bad}")
+                except ValueError:
+                    pass
+            # 排序：自定义字段之间（2026-09-16：UI 层已放开内置/虚拟也参与排序）
+            cids = [d["id"] for d in db.list_field_defs() if not d["is_builtin"]]
+            assert len(cids) == 3, cids
+            assert db.swap_order("field_defs", cids, cids[1], -1) is True
+            order = [d["field_key"] for d in db.list_field_defs() if not d["is_builtin"]]
+            assert order[0] == "custom_2", order
+            cids2 = [d["id"] for d in db.list_field_defs() if not d["is_builtin"]]
+            assert db.swap_order("field_defs", cids2, cids2[0], -1) is False  # 边界不写库
+            # 归档不影响已填内容
+            eid2 = db.add_entry(Entry(name="归档测试条目"))
+            db.set_entry_field_value(eid2, "custom_1", "保留内容")
+            db.archive_field_def("custom_1")
+            assert db.get_entry_field_value(eid2, "custom_1") == "保留内容"
+            db.restore_field_def("custom_1")
+            print("[字段] 归档/恢复/内置不可归档/排序/取值保留 通过")
+            # ---- 2026-09-16（批次 14）：详情区"手动隐藏"字段（meta 存储，硬隐藏）----
+            _n_defs_before = len(db.list_field_defs())   # 隐藏前后字段定义数应完全不变
+            assert db.get_hidden_field_keys() == set()          # 默认无隐藏
+            db.set_hidden_field_keys(["origin", "_tags", "custom_2"])
+            assert db.get_hidden_field_keys() == {"origin", "_tags", "custom_2"}
+            # 去空 / 去重 / 剔除 name（① 名称永不隐藏）
+            db.set_hidden_field_keys(["origin", "origin", "  ", "name", " _time "])
+            assert db.get_hidden_field_keys() == {"origin", "_time"}
+            # 幂等：重复写入同一集合不产生变化
+            db.set_hidden_field_keys(["origin", "_time"])
+            assert db.get_hidden_field_keys() == {"origin", "_time"}
+            # 清空
+            db.set_hidden_field_keys([])
+            assert db.get_hidden_field_keys() == set()
+            # 隐藏**不改变**字段定义与取值（纯显示偏好，不影响数据）
+            assert len(db.list_field_defs()) == _n_defs_before
+            assert db.get_entry_field_value(eid2, "custom_1") == "保留内容"
+            print("[字段] 手动隐藏（meta 读写/去空去重/剔除name/清空/不影响数据）通过")
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _field_values_selftest() -> None:
+    """schema v4 自定义字段取值 + 统一读取层 + 搜索纳入自定义字段 自测（第 1 期 1-A-2）。"""
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="promptsprite_fv_")
+    try:
+        p = os.path.join(tmp, "fv.db")
+        db = Database(p)
+        try:
+            did = db.add_domain("测试根目录")
+            l1 = db.add_category("测试一级", domain_id=did)
+            eid = db.add_entry(Entry(name="字段测试条目", category_id=l1,
+                                     intro="内置介绍内容"))
+            # 1. 自定义字段：写入 / 读取 / upsert（同键不新增行）
+            db.set_entry_field_value(eid, "custom_author", "张三")
+            assert db.get_entry_field_value(eid, "custom_author") == "张三"
+            db.set_entry_field_value(eid, "custom_author", "李四")
+            assert db.get_entry_field_value(eid, "custom_author") == "李四"
+            assert len(db.list_entry_field_values(eid)) == 1
+            # 2. 未写入返回 None（区别于写入空串）
+            assert db.get_entry_field_value(eid, "custom_none") is None
+            # 3. 统一读取层：内置 13 项恒在（10 内置 + 3 虚拟）+ 自定义项并入；不存在条目返回空 dict
+            f = db.get_entry_fields(eid)
+            assert len([k for k in f if not k.startswith("custom_")]) == 13, f
+            assert f["name"] == "字段测试条目"
+            assert f["intro"] == "内置介绍内容"
+            assert f["custom_author"] == "李四"
+            assert db.get_entry_fields(999999) == {}
+            # 4. 搜索：命中自定义字段取值；内置字段搜索行为不变
+            assert [x["id"] for x in db.search("李四")] == [eid]
+            assert [x["id"] for x in db.search("字段测试条目")] == [eid]
+            assert [x["id"] for x in db.search("内置介绍")] == [eid]
+            assert db.search("不存在的词xyz") == []
+            # 5. content_key 不含自定义字段（判重语义不变）
+            k1 = Database.content_key(db.get_entry(eid))
+            db.set_entry_field_value(eid, "custom_author", "王五")
+            k2 = Database.content_key(db.get_entry(eid))
+            assert k1 == k2
+            # 6. 删除单个取值
+            db.delete_entry_field_value(eid, "custom_author")
+            assert db.get_entry_field_value(eid, "custom_author") is None
+            assert "custom_author" not in db.get_entry_fields(eid)
+            # 7. 级联：删除条目 → 取值行随之清除
+            db.set_entry_field_value(eid, "custom_x", "X")
+            assert len(db.list_entry_field_values(eid)) == 1
+            db.delete_entry(eid, purge_image=False)
+            assert db.conn.execute(
+                "SELECT COUNT(1) FROM entry_field_values WHERE entry_id = ?",
+                (eid,)).fetchone()[0] == 0
+            print("[字段取值] 写入/upsert/读取层/搜索/判重不变/删除/级联 通过")
+            # 8. 复制条目 / 回收站 / 删除日志快照 均携带自定义字段与标签（1-A-5 第 3 步·下 / 1-C-4）
+            eid3 = db.add_entry(Entry(name="联动测试条目", category_id=l1))
+            db.set_entry_field_value(eid3, "custom_link", "联动值")
+            db.set_entry_tags(eid3, ["联动标签"])
+            copy_id = db.copy_entry_to(eid3, l1)
+            assert db.get_entry_field_value(copy_id, "custom_link") == "联动值"
+            assert db.list_entry_tag_names(copy_id) == ["联动标签"]
+            assert db.trash_entry(eid3) is True
+            tr = db.list_trash()[0]
+            assert (tr["payload"].get("custom_fields") or {}).get("custom_link") == "联动值"
+            assert tr["payload"].get("tags") == ["联动标签"]
+            rid = db.restore_from_trash(tr["id"])
+            assert db.get_entry_field_value(rid, "custom_link") == "联动值"
+            assert db.list_entry_tag_names(rid) == ["联动标签"]
+            db.delete_entry(rid, purge_image=False)
+            row = db.conn.execute(
+                "SELECT payload FROM deletion_log WHERE kind = 'entry'"
+                " ORDER BY id DESC LIMIT 1").fetchone()
+            _snap = json.loads(row["payload"])
+            assert _snap.get("custom_fields", {}).get("custom_link") == "联动值"
+            assert _snap.get("tags") == ["联动标签"]
+            print("[字段] 复制/回收站/删除日志快照 均携带自定义字段与标签 通过")
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _tags_selftest() -> None:
+    """schema v4 标签（1-C-1）自测：打标签/计数/且或查询/改名/合并/删除/清理/级联/搜索。"""
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="promptsprite_tags_")
+    try:
+        p = os.path.join(tmp, "tags.db")
+        db = Database(p)
+        try:
+            did = db.add_domain("测试根")
+            l1 = db.add_category("测试L1", domain_id=did)
+            e1 = db.add_entry(Entry(name="条目一", category_id=l1))
+            e2 = db.add_entry(Entry(name="条目二", category_id=l1))
+            e3 = db.add_entry(Entry(name="条目三", category_id=l1))
+            # 1. 打标签：自动建标签 + 去重
+            db.set_entry_tags(e1, ["写实", "电影感", "写实"])
+            db.set_entry_tags(e2, ["写实", "胶片"])
+            db.set_entry_tags(e3, ["电影感"])
+            assert sorted(t["name"] for t in db.list_entry_tags(e1)) == ["写实", "电影感"]
+            # 2. 标签计数
+            counts = {t["name"]: t["entry_count"] for t in db.list_tags_with_counts()}
+            assert counts == {"写实": 2, "电影感": 2, "胶片": 1}, counts
+            # 3. 按标签跨分类查询：and / or / 空
+            t_xs = db.get_tag_by_name("写实")["id"]
+            t_dy = db.get_tag_by_name("电影感")["id"]
+            t_jp = db.get_tag_by_name("胶片")["id"]
+            assert [x["name"] for x in db.list_entries_by_tags([t_xs, t_dy], "and")] == ["条目一"]
+            assert {x["name"] for x in db.list_entries_by_tags([t_xs, t_dy], "or")} == \
+                {"条目一", "条目二", "条目三"}
+            assert [x["name"] for x in db.list_entries_by_tags([t_jp], "or")] == ["条目二"]
+            assert db.list_entries_by_tags([], "and") == []
+            # 4. add_tag 幂等 + 空名拒绝
+            assert db.add_tag("写实") == t_xs
+            try:
+                db.add_tag("   ")
+                raise SystemExit("空标签名应被拒绝")
+            except ValueError:
+                pass
+            # 5. 改名 + 重名冲突
+            db.rename_tag(t_jp, "菲林")
+            assert db.get_tag_by_name("菲林") is not None
+            try:
+                db.rename_tag(t_jp, "写实")
+                raise SystemExit("重名改名应被拒绝")
+            except ValueError:
+                pass
+            # 6. 合并：菲林 → 写实
+            db.merge_tags(db.get_tag_by_name("菲林")["id"], t_xs)
+            assert db.get_tag_by_name("菲林") is None
+            assert sorted(x["name"] for x in db.list_entries_by_tags([t_xs], "or")) == \
+                ["条目一", "条目二"]
+            # 7. 搜索命中标签名
+            assert {x["id"] for x in db.search("写实")} == {e1, e2}
+            # 8. 删除标签不影响条目
+            db.delete_tag(t_dy)
+            assert db.get_tag(t_dy) is None
+            assert db.get_entry(e3) is not None and db.list_entry_tags(e3) == []
+            # 9. 清理未使用标签
+            db.add_tag("无人使用")
+            assert db.purge_unused_tags() == 1
+            # 10. 删除条目 → 标签关联级联清理
+            db.delete_entry(e1, purge_image=False)
+            assert db.conn.execute(
+                "SELECT COUNT(1) FROM entry_tags WHERE entry_id = ?", (e1,)).fetchone()[0] == 0
+            # 11. 无标签条目（2026-09-14 新增 list_untagged / count_untagged）
+            _un = db.list_untagged()
+            _un_ids = {x["id"] for x in _un}
+            assert e3 in _un_ids, _un_ids                    # e3 的标签刚被删掉 → 应无标签
+            assert e1 not in _un_ids, _un_ids                # e1 已被删除 → 不在条目表
+            # 定义自洽：列出的每一条都确实没有任何标签
+            assert all(not db.list_entry_tags(x["id"]) for x in _un)
+            assert db.count_untagged() == len(_un), (db.count_untagged(), len(_un))
+            db.set_entry_tags(e3, ["补一个"])
+            assert e3 not in {x["id"] for x in db.list_untagged()}   # 打上标签后应移出列表
+            # 12. 2026-09-15（审核 M-2）：计数失败时返回 **−1**（不再静默返回 0）。
+            #     在**另一个临时库**里删掉 entry_tags 表来模拟"缺表/异常"，避免影响本用例连接。
+            _tmp2 = tempfile.mkdtemp(prefix="promptsprite_untagged_")
+            try:
+                _db2 = Database(os.path.join(_tmp2, "t.db"))
+                _db2.conn.execute("DROP TABLE entry_tags")
+                _db2.conn.commit()
+                assert _db2.count_untagged() == -1, "缺表时应返回 -1（表示未知）"
+                _db2.close()
+            finally:
+                shutil.rmtree(_tmp2, ignore_errors=True)
+            print("[标签] 打标签/计数/且或查询/改名/合并/删除/清理/级联/搜索 通过")
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _bulk_tags_selftest() -> None:
+    """批量写标签（2026-09-14 12:30，阶段 1）自测。
+
+    覆盖：append 并入 / 幂等（重复执行不重复写）/ replace 替换 / touch_updated 开关 /
+    空输入不报错。
+    """
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="promptsprite_bulktags_")
+    try:
+        db = Database(os.path.join(tmp, "t.db"))
+        try:
+            did = db.add_domain("根")
+            l1 = db.add_category("L1", domain_id=did)
+            e1 = db.add_entry(Entry(name="A", category_id=l1))
+            e2 = db.add_entry(Entry(name="B", category_id=l1))
+            db.set_entry_tags(e1, ["已有"])
+
+            # 1. append：并入既有标签（跨条目共享标签只建一次 → 新1/新2 共 2 个新标签）
+            r = db.set_entry_tags_bulk({e1: ["新1", "新2"], e2: ["新2"]}, mode="append")
+            assert r["entries"] == 2 and r["links"] == 3 and r["tags_created"] == 2, r
+            assert sorted(t["name"] for t in db.list_entry_tags(e1)) == ["已有", "新1", "新2"]
+
+            # 2. 幂等：重复执行不再新增关联 / 不再新建标签
+            r2 = db.set_entry_tags_bulk({e1: ["新1", "新2"]}, mode="append")
+            assert r2["links"] == 0 and r2["tags_created"] == 0, r2
+
+            # 3. replace：替换该条目全部标签
+            r3 = db.set_entry_tags_bulk({e1: ["只此一个"]}, mode="replace")
+            assert r3["links"] == 1 and [t["name"] for t in db.list_entry_tags(e1)] == ["只此一个"], r3
+
+            # 4. touch_updated=False 不动 entries.updated_at（预置数据初始化）
+            db.conn.execute("UPDATE entries SET updated_at = '2000-01-01 00:00:00' WHERE id = ?",
+                            (e2,))
+            db.conn.commit()
+            db.set_entry_tags_bulk({e2: ["额外"]}, touch_updated=False)
+            assert db.get_entry(e2)["updated_at"] == "2000-01-01 00:00:00", "不应刷新时间戳"
+
+            # 5. touch_updated=True 刷新时间戳（默认行为）
+            db.set_entry_tags_bulk({e2: ["再一个"]}, touch_updated=True)
+            assert db.get_entry(e2)["updated_at"] != "2000-01-01 00:00:00", "应刷新时间戳"
+
+            # 6. 空输入不报错
+            assert db.set_entry_tags_bulk([]) == {"entries": 0, "links": 0, "tags_created": 0}
+            assert db.set_entry_tags_bulk({e1: []}, mode="replace")["links"] == 0
+            assert db.list_entry_tags(e1) == []
+
+            print("[批量标签] append/replace/幂等/时间戳控制/空输入 通过")
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _hotwords_selftest() -> None:
+    """热点词表（2026-09-14，阶段 4 之 4-a）自测。
+
+    覆盖：文本解析（多分隔符/去重/去空）、并集追加的幂等性、整体替换、按名删除、
+    非法项（空/超长）丢弃、超上限截断、来源网址过滤、非法 JSON 容错、与 tags 表隔离。
+    """
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="promptsprite_hotwords_")
+    try:
+        p = os.path.join(tmp, "hotwords.db")
+        db = Database(p)
+        try:
+            # 1. 初始为空
+            assert db.list_hotwords() == [], db.list_hotwords()
+            assert db.count_hotwords() == 0
+            assert db.list_hotword_sources() == []
+
+            # 2. 文本解析：换行 / 逗号 / 顿号 / 分号 / 竖线 / 制表符 + 去空去重 + 压缩空白
+            parsed = Database.parse_hotwords_text(
+                "多巴胺穿搭\n新中式,  赛博朋克、松弛感;慵懒风|美拉德\t多巴胺穿搭\n\n  \n")
+            assert parsed == ["多巴胺穿搭", "新中式", "赛博朋克", "松弛感", "慵懒风", "美拉德"], parsed
+
+            # 3. 并集追加 + 幂等（重复词不新增，计入 skipped）
+            r1 = db.add_hotwords(parsed)
+            assert r1["added_count"] == 6 and r1["total"] == 6, r1
+            r2 = db.add_hotwords(["多巴胺穿搭", "新中式"])
+            assert r2["added_count"] == 0 and r2["skipped"] == 2 and r2["total"] == 6, r2
+            assert db.list_hotwords() == parsed
+
+            # 4. 非法项（空串 / 超长）被丢弃并计入 invalid
+            long_word = "超" * (Database.HOTWORD_MAX_LEN + 1)
+            r3 = db.add_hotwords(["", "   ", long_word, "莫兰迪"])
+            assert r3["invalid"] == 3 and r3["added_count"] == 1, r3
+            assert db.count_hotwords() == 7
+
+            # 5. 按名删除（幂等：不存在的不计数）
+            assert db.remove_hotwords(["莫兰迪", "不存在的词"]) == 1
+            assert db.remove_hotwords([]) == 0
+            assert db.count_hotwords() == 6
+
+            # 6. 整体替换（replace）：直接给定新表
+            db.set_hotwords(["极简", "极简", "国风"])
+            assert db.list_hotwords() == ["极简", "国风"], db.list_hotwords()
+
+            # 7. 超上限截断（临时把上限改小，避免写 2000 条）
+            _keep_max = Database.HOTWORD_MAX_COUNT
+            try:
+                Database.HOTWORD_MAX_COUNT = 2
+                r4 = db.add_hotwords(["甲", "乙", "丙"])
+                assert r4["added_count"] == 0 and r4["skipped"] == 3, r4
+                db.set_hotwords(["甲", "乙", "丙"])
+                assert db.list_hotwords() == ["甲", "乙"], db.list_hotwords()
+            finally:
+                Database.HOTWORD_MAX_COUNT = _keep_max
+
+            # 8. 来源网址：仅保留 http/https、去重、按顺序
+            n = db.set_hotword_sources(["https://a.com/x", "http://b.com", "  ",
+                                        "ftp://c.com", "https://a.com/x", "b.com"])
+            assert n == 2, n
+            assert db.list_hotword_sources() == ["https://a.com/x", "http://b.com"]
+
+            # 9. 非法 JSON 容错（不抛异常，返回空）
+            db.set_meta(META_HOTWORDS, "{不是数组}")
+            assert db.list_hotwords() == []
+            db.set_meta(META_HOTWORDS, '{"a": 1}')
+            assert db.list_hotwords() == []
+            db.set_meta(META_HOTWORD_SOURCES, "not-json")
+            assert db.list_hotword_sources() == []
+
+            # 10. 与 tags 表隔离：热点词不会产生任何标签 / 条目关联
+            db.set_hotwords(["多巴胺穿搭", "新中式"])
+            assert db.list_tags() == [] and db.list_tags_with_counts() == []
+            assert db.conn.execute("SELECT COUNT(1) FROM entry_tags").fetchone()[0] == 0
+
+            print("[热点词] 文本解析/追加幂等/替换/删除/非法项/超上限/来源网址/容错/与tags隔离 通过")
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _list_config_selftest() -> None:
+    """第 3 期列表框"数据源配置"自测：3-a 序列型 / 3-b 目录层级型 / 3-c 条目型 + 引用统计。"""
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="promptsprite_listsrc_")
+    try:
+        db = Database(os.path.join(tmp, "lc.db"))
+        try:
+            key = db.add_field_def("风格", "list")
+            # 1. 缺省配置：默认序列型、空序列、单选、允许新建、无路径前缀
+            cfg = db.list_field_config(key)
+            assert cfg["source_type"] == "sequence" and cfg["items"] == []
+            assert cfg["multi"] is False and cfg["allow_new"] is True
+            assert cfg["path_prefix"] is False
+            assert db.resolve_list_options(key) == []
+            # 2. 写入序列 + 多选 + 关闭新建项
+            db.set_field_config(key, {"source_type": "sequence",
+                                      "items": ["写实", "电影感", "写实", "", " 电影感 "],
+                                      "multi": True, "allow_new": False,
+                                      "path_prefix": True})
+            cfg = db.list_field_config(key)
+            assert cfg["items"] == ["写实", "电影感"]          # 去重 + 去空 + 去空白
+            assert cfg["multi"] is True and cfg["allow_new"] is False
+            assert cfg["path_prefix"] is True
+            assert [o["value"] for o in db.resolve_list_options(key)] == ["写实", "电影感"]
+            assert [o["label"] for o in db.resolve_list_options(key)] == ["写实", "电影感"]
+            # 3. 非法 source_type → 回退为 sequence（不报错）
+            db.set_field_config(key, {"source_type": "不存在", "items": ["A"]})
+            assert db.list_field_config(key)["source_type"] == "sequence"
+            # 4. 预留类型：可写入并被识别（entries 为 3-c 实现，取值入口暂返回空）
+            db.set_field_config(key, {"source_type": "entries"})
+            assert db.list_field_config(key)["source_type"] == "entries"
+            assert db.resolve_list_options(key) == []
+            # 5. 配置损坏（非 JSON）→ 安全默认，不抛异常
+            db.conn.execute("UPDATE field_defs SET config_json = ? WHERE field_key = ?",
+                            ("{坏数据", key))
+            db.conn.commit()
+            assert db.list_field_config(key)["source_type"] == "sequence"
+            # 6. 目录层级型（3-b）：层级 / 范围 / 路径前缀 / 稳定令牌 / 改名与删除
+            pid = db.add_project("视频项目")
+            did = db.add_domain("图像", project_id=pid)
+            l1 = db.add_category("人像", domain_id=did)
+            l2 = db.add_category("写实人像", parent_id=l1)
+            did2 = db.add_domain("音频", project_id=pid)
+            l1b = db.add_category("配乐", domain_id=did2)
+            db.set_field_config(key, {"source_type": "tree_level", "level": "cat1",
+                                      "scope": "all", "multi": True,
+                                      "path_prefix": True, "allow_new": True,
+                                      "items": ["不该生效"]})
+            cfg = db.list_field_config(key)
+            assert cfg["source_type"] == "tree_level" and cfg["level"] == "cat1"
+            assert cfg["scope"] == "all" and cfg["node_refs"] == []
+            assert cfg["allow_new"] is False        # 层级型不能"新建项"
+            opts = db.resolve_list_options(key)
+            assert [o["value"] for o in opts] == [f"cat:{l1}", f"cat:{l1b}"]   # 稳定令牌
+            assert opts[0]["label"] == "视频项目 / 图像 / 人像"                 # 路径前缀
+            assert all("不该生效" not in o["label"] for o in opts)              # 序列项对层级型不生效
+            # 二级 + 只显示节点名
+            db.set_field_config(key, {"source_type": "tree_level", "level": "cat2",
+                                      "scope": "all", "path_prefix": False})
+            assert [(o["value"], o["label"]) for o in db.resolve_list_options(key)] \
+                == [(f"cat:{l2}", "写实人像")]
+            # 范围＝指定节点（按根目录过滤）
+            db.set_field_config(key, {"source_type": "tree_level", "level": "cat1",
+                                      "scope": "nodes", "node_refs": [f"domain:{did2}"],
+                                      "path_prefix": True})
+            assert [o["value"] for o in db.resolve_list_options(key)] == [f"cat:{l1b}"]
+            # 范围＝指定项目 → 其下全部（含二级）
+            db.set_field_config(key, {"source_type": "tree_level", "level": "cat2",
+                                      "scope": "nodes", "node_refs": [f"project:{pid}"]})
+            assert [o["value"] for o in db.resolve_list_options(key)] == [f"cat:{l2}"]
+            # 非法 level/scope/node_refs → 安全回退，不抛异常
+            db.set_field_config(key, {"source_type": "tree_level", "level": "不存在",
+                                      "scope": "xx", "node_refs": ["坏令牌", "cat:1"]})
+            cfg = db.list_field_config(key)
+            assert cfg["level"] == "cat1" and cfg["scope"] == "all"
+            assert cfg["node_refs"] == ["cat:1"]
+            # 改名 → 显示自动跟随新名（令牌不变）；删除节点 → 候选里消失（失联判定前提）
+            db.set_field_config(key, {"source_type": "tree_level", "level": "cat1",
+                                      "scope": "all", "path_prefix": False})
+            db.rename_category(l1, "人物")
+            assert db.resolve_list_options(key)[0]["label"] == "人物"
+            db.delete_category(l1b)
+            assert [o["value"] for o in db.resolve_list_options(key)] == [f"cat:{l1}"]
+            assert db.ref_name(f"cat:{l1}") == "人物"
+            assert db.ref_name(f"project:{pid}") == "视频项目"
+            assert db.ref_name(f"domain:{did}") == "图像"
+            assert db.ref_name("坏令牌") == ""
+            # 7. 条目型（3-c）：全部 / 指定节点子树 / 令牌 / 改名跟随 / 删除失效 / 引用统计
+            e1 = db.add_entry(Entry(category_id=l2, name="写实少女"))   # 二级分类下
+            e2 = db.add_entry(Entry(category_id=l1, name="人像写真"))   # 一级分类下
+            e3 = db.add_entry(Entry(category_id=None, name="未分类条目"))
+            db.set_field_config(key, {"source_type": "entries", "scope": "all",
+                                      "path_prefix": True, "multi": True})
+            cfg = db.list_field_config(key)
+            assert cfg["source_type"] == "entries" and cfg["allow_new"] is False
+            opts = db.resolve_list_options(key)
+            assert [o["value"] for o in opts] == [f"entry:{e2}", f"entry:{e1}", f"entry:{e3}"]
+            assert opts[0]["label"] == "视频项目 / 图像 / 人物 / 人像写真"
+            assert opts[1]["label"] == "视频项目 / 图像 / 人物 / 写实人像 / 写实少女"
+            assert opts[2]["label"] == "未分类条目"          # 未分类：无分类路径
+            # 范围＝指定节点（分类子树 / 根目录 / 项目）
+            db.set_field_config(key, {"source_type": "entries", "scope": "nodes",
+                                      "node_refs": [f"cat:{l2}"], "path_prefix": False})
+            assert [(o["value"], o["label"]) for o in db.resolve_list_options(key)] \
+                == [(f"entry:{e1}", "写实少女")]
+            db.set_field_config(key, {"source_type": "entries", "scope": "nodes",
+                                      "node_refs": [f"domain:{did}"], "path_prefix": False})
+            assert [o["value"] for o in db.resolve_list_options(key)] == [f"entry:{e2}", f"entry:{e1}"]
+            db.set_field_config(key, {"source_type": "entries", "scope": "nodes",
+                                      "node_refs": [f"project:{pid}"], "path_prefix": False})
+            assert len(db.resolve_list_options(key)) == 2
+            db.set_field_config(key, {"source_type": "entries", "scope": "nodes",
+                                      "node_refs": [], "path_prefix": False})
+            assert db.resolve_list_options(key) == []        # 未指定节点 → 无候选
+            # 引用统计（删除前提示；先写入引用再验证）
+            db.set_field_config(key, {"source_type": "entries", "scope": "all"})
+            db.set_entry_field_value(
+                e2, key, "写实少女",
+                json.dumps([{"value": f"entry:{e1}", "label": "写实少女"}], ensure_ascii=False))
+            rep = db.refs_using_entry(e1)
+            assert rep["total"] == 1 and rep["fields"][0]["field_key"] == key
+            assert db.refs_using_entry(e3)["total"] == 0
+            key2 = db.add_field_def("所属层级", "list")
+            db.set_entry_field_value(
+                e2, key2, "写实人像",
+                json.dumps([{"value": f"cat:{l2}", "label": "人物 / 写实人像"}], ensure_ascii=False))
+            assert db.refs_using_category(l2)["total"] == 1  # 自身
+            assert db.refs_using_category(l1)["total"] == 1  # 子分类的引用也算
+            db.set_entry_field_value(
+                e3, key2, "图像",
+                json.dumps([{"value": f"domain:{did}", "label": "视频项目 / 图像"}], ensure_ascii=False))
+            assert db.refs_using_domain(did)["total"] == 1
+            assert db.refs_using_domain(did2)["total"] == 0
+            # 改名跟随 / 删除失效
+            db.conn.execute("UPDATE entries SET name = ? WHERE id = ?", ("人像写真集", e2))
+            db.conn.commit()
+            assert db.resolve_list_options(key)[0]["label"] == "人像写真集"
+            db.delete_entry(e1)
+            assert [o["value"] for o in db.resolve_list_options(key)] == [f"entry:{e2}", f"entry:{e3}"]
+            print("[列表框] 默认配置/序列写入去重/多选/新建项/路径前缀/非法回退/损坏容错/"
+                  "目录层级（层级·范围·路径前缀·令牌稳定·改名跟随·删除失效）/"
+                  "条目（全部·指定节点·令牌·改名跟随·删除失效·引用统计） 通过")
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _images_selftest() -> None:
+    """第 2 期 2-a/2-d：条目图集自测。
+
+    2-a：增/列/计数/命名/排序/转本地/删除/级联；
+    2-d：联动（条目快照 / 复制条目 / 回收站恢复 / 彻底删除释放文件 / 子树深拷贝）。
+    """
+    global data_dir
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="promptsprite_img_")
+    _orig_data_dir = data_dir
+    try:
+        tmpdata = os.path.join(tmp, "data")
+        os.makedirs(os.path.join(tmpdata, IMAGES_DIR_NAME), exist_ok=True)
+        data_dir = lambda: tmpdata   # 自测期间 data/ 指向临时目录（不碰真实数据）
+        p = os.path.join(tmp, "img.db")
+        db = Database(p)
+        try:
+            did = db.add_domain("测试根")
+            l1 = db.add_category("测试L1", domain_id=did)
+            eid = db.add_entry(Entry(name="图集条目", category_id=l1))
+            assert db.list_entry_images(eid) == []
+            # 1. 新增：本地 + 外链
+            i1 = db.add_entry_image(eid, "local", path="images/entry_x_0.png")
+            i2 = db.add_entry_image(eid, "url", source_url="https://a.com/1.jpg")
+            assert db.count_entry_images(eid) == 2
+            imgs = db.list_entry_images(eid)
+            assert [r["id"] for r in imgs] == [i1, i2]
+            assert imgs[1]["kind"] == "url"
+            assert imgs[1]["source_url"] == "https://a.com/1.jpg"
+            # 2. 参数校验：非法类型 / 外链缺网址
+            for bad in (("bad", ""), ("url", "")):
+                try:
+                    db.add_entry_image(eid, bad[0], source_url=bad[1])
+                    raise SystemExit("应拒绝非法参数")
+                except ValueError:
+                    pass
+            # 3. 图集文件名递增且不冲突（entry_{id}_{n}.{ext}）
+            r1 = db.gallery_file_rel(eid, ".png")
+            r2 = db.gallery_file_rel(eid, "jpg")
+            assert r1.endswith(".png") and f"entry_{eid}_" in r1
+            assert r2.endswith(".jpg") and f"entry_{eid}_" in r2
+            # 4. 排序：上移生效、越界不写
+            assert db.swap_entry_image_order(eid, i2, -1) is True
+            assert [r["id"] for r in db.list_entry_images(eid)] == [i2, i1]
+            assert db.swap_entry_image_order(eid, i2, -1) is False
+            # 5. 外链 → 本地（保留 source_url）
+            db.set_entry_image_local(i2, "images/entry_x_1.jpg")
+            row = next(r for r in db.list_entry_images(eid) if r["id"] == i2)
+            assert row["kind"] == "local" and row["path"] == "images/entry_x_1.jpg"
+            assert row["source_url"] == "https://a.com/1.jpg"
+            # 6. 删除一张附加图
+            db.remove_entry_image(i1, purge_file=False)
+            assert db.count_entry_images(eid) == 1
+            # 7. 删除条目 → 图集级联清理
+            db.delete_entry(eid, purge_image=False)
+            assert db.conn.execute(
+                "SELECT COUNT(1) FROM entry_images WHERE entry_id = ?",
+                (eid,)).fetchone()[0] == 0
+
+            # ---- 2-d：联动（真实文件） ----
+            def _mk(rel: str) -> str:
+                full = os.path.join(tmpdata, rel)
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                with open(full, "wb") as f:
+                    f.write(b"\x89PNG\r\n\x1a\n")
+                return rel
+
+            e2 = db.add_entry(Entry(name="联动条目", category_id=l1))
+            cover = _mk(os.path.join(IMAGES_DIR_NAME, f"entry_{e2}.png"))
+            db.set_entry_image(e2, cover)
+            g1 = _mk(db.gallery_file_rel(e2, ".png"))
+            db.add_entry_image(e2, "local", path=g1)
+            db.add_entry_image(e2, "url", source_url="https://a.com/z.jpg")
+            db.set_entry_tags(e2, ["写实"])
+            # 8. 快照含图集（回收站/删除日志共用）
+            assert len(db.entry_snapshot(db.get_entry(e2)).get("images") or []) == 2
+            # 9. 复制条目：图集行复制 + 本地图复制为新文件（互不牵连）
+            cid2 = db.add_category("测试L2", domain_id=did)
+            new_id = db.copy_entry_to(e2, cid2)
+            n_imgs = db.list_entry_images(new_id)
+            assert len(n_imgs) == 2
+            assert n_imgs[0]["kind"] == "local" and n_imgs[0]["path"] != g1
+            assert os.path.isfile(os.path.join(tmpdata, n_imgs[0]["path"]))
+            assert n_imgs[1]["kind"] == "url" and n_imgs[1]["source_url"] == "https://a.com/z.jpg"
+            assert db.get_entry(new_id)["image_path"] != cover
+            assert db.list_entry_tag_names(new_id) == ["写实"]
+            # 10. 回收站：进站 → 恢复 → 图集仍在（文件在回收站期间被保留）
+            assert db.trash_entry(e2) is True
+            _tid = db.conn.execute("SELECT id FROM trash ORDER BY id DESC LIMIT 1").fetchone()[0]
+            r_id = db.restore_from_trash(_tid)
+            assert r_id and db.count_entry_images(r_id) == 2
+            # 11. 彻底删除：本地图集文件被释放
+            _fp = [r["path"] for r in db.list_entry_images(r_id) if r["kind"] == "local"][0]
+            db.delete_entry(r_id, purge_image=True)
+            assert db.count_entry_images(r_id) == 0
+            assert not os.path.isfile(os.path.join(tmpdata, _fp))
+            # 12. 子树深拷贝：标签与图集一并复制（2-d 补齐此前的遗漏）
+            new_cat = db._copy_subtree_tx(cid2, None, "副本分类")
+            db.conn.commit()
+            copied = db.list_entries(new_cat)
+            assert copied and db.count_entry_images(copied[0]["id"]) == 2
+            assert db.list_entry_tag_names(copied[0]["id"]) == ["写实"]
+            print("[图集] 增/列/计数/命名/排序/转本地/删除/级联/复制/快照/回收站/彻底删除/子树 通过")
+        finally:
+            db.close()
+    finally:
+        data_dir = _orig_data_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     _selftest()
     _migrate_selftest()
+    _fields_selftest()
+    _field_values_selftest()
+    _tags_selftest()
+    _bulk_tags_selftest()  # 2026-09-14 12:30（阶段 1）：批量写标签
+    _hotwords_selftest()   # 2026-09-14（阶段 4 之 4-a）：热点词表读写
+    _list_config_selftest()
+    _images_selftest()

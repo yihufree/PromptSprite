@@ -20,7 +20,13 @@ _MODULES = [
     ("app.database", "数据库层自测"),
     ("app.backup", "备份模块自测"),
     ("app.incremental_backup", "增量备份模块自测"),  # 2026-08-29：纳入统一自测入口
+    ("app.parser.json_io", "JSON 导入导出自测"),      # 2026-09-13（4-a）：v5 四层路径 + 字段定义随包
+    ("app.parser.excel_io", "Excel 导入导出自测"),      # 2026-09-13：追加『项目类别』列往返 + 旧模板兼容
+    ("app.parser.hierarchy_import", "层级导入器自测"),  # 2026-09-13（4-b）：源解析 + 层级结构化 + 载荷
+    ("app.parser.fetcher", "联网抓取层自测"),        # 2026-09-14（5-a）：本地 HTTP 服务 + 注入假响应
     ("app.parser.md_parser", "MD 解析器自测"),
+    # 2026-09-17（新问题 A/B 修复）：存量"垃圾标签"清理（扫描 / A 类删除 / B 类重命名合并 / 幂等）
+    ("app.tag_cleanup", "标签清理模块自测"),
 ]
 
 

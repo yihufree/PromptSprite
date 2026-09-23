@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import sqlite3
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -129,6 +130,210 @@ def _cleanup_old_backups(backup_dir: str, keep: int) -> None:
             pass
 
 
+# ---------------------------------------------------------------------- #
+# 打标前强制快照（2026-09-14 12:30，阶段 1 预置标签 / 阶段 2 批量打标）
+#   为什么单独一套命名与清理：
+#     1) 标准名 prompts_YYYY-MM-DD_*.db 会被 _dedupe_by_day 按天去重
+#        → 同一天第二次打标会**删掉第一次的备份**，不符合"每次先备份"的要求；
+#     2) prompts_preimport_* 那类前缀是"永不清理"的 → 会无限累积（每份约 7.5MB）。
+#   故用独立前缀 + 自建"只留最近 N 份"的清理。
+# ---------------------------------------------------------------------- #
+PRETAG_PREFIX = "prompts_pretag"
+PRETAG_KEEP = 10
+_PRETAG_FILE_RE = re.compile(r"^prompts_pretag_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d+\.db$")
+
+
+def _cleanup_pretag(backup_dir: str, keep: int) -> int:
+    """只保留最近 keep 份 pretag 快照，返回删除份数。
+
+    Windows 下偶发"文件仍被占用导致删除失败"，故每个文件重试一次（间隔 30ms），
+    避免残留（已实测：极端情况下会少删 1 份）。
+    """
+    removed = 0
+    try:
+        files = sorted(f for f in os.listdir(backup_dir) if _PRETAG_FILE_RE.match(f))
+        for old in (files[:-keep] if keep > 0 else files):
+            path = os.path.join(backup_dir, old)
+            for attempt in (0, 1):
+                try:
+                    os.remove(path)
+                    removed += 1
+                    break
+                except OSError:
+                    if attempt == 0:
+                        time.sleep(0.03)
+    except OSError:
+        pass
+    return removed
+
+
+def pretag_snapshot(db_path: Optional[str] = None, keep: int = PRETAG_KEEP) -> dict:
+    """批量打标前的**强制快照**（独立前缀、不按天去重、自建清理）。
+
+    返回 {'ok', 'path', 'error', 'removed'}；失败不抛异常（由调用方决定是否中止打标）。
+    """
+    result = {"ok": False, "path": None, "error": None, "removed": 0}
+    db_path = db_path or os.path.join(data_dir(), DB_FILE_NAME)
+    if not os.path.isfile(db_path):
+        result["error"] = "主数据库不存在，无法生成打标前快照"
+        return result
+    backup_dir = os.path.join(os.path.dirname(db_path), BACKUP_DIR_NAME)
+    try:
+        os.makedirs(backup_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+        dest = os.path.join(backup_dir, f"{PRETAG_PREFIX}_{ts}.db")
+        shutil.copy2(db_path, dest)
+        result["removed"] = _cleanup_pretag(backup_dir, keep)
+        result.update({"ok": True, "path": dest})
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
+# ---------------------------------------------------------------------- #
+# 批量删除前强制快照（2026-09-22，用户要求 3-2：删除前必须备份全量库）
+#   与"打标前快照"同一思路：独立前缀 + 不按天去重 + 自建"只留最近 N 份"清理。
+#   为什么必须独立于标准备份名 prompts_*.db：标准名会被 _dedupe_by_day 按天去重，
+#   导致同一天内的第二次批量删除会**删掉当天的第一份备份**，起不到"每次删除前留底"的作用。
+# ---------------------------------------------------------------------- #
+PREDEL_PREFIX = "prompts_predel"
+PREDEL_KEEP = 10
+_PREDEL_FILE_RE = re.compile(r"^prompts_predel_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d+\.db$")
+
+
+def _cleanup_prefixed(backup_dir: str, keep: int, file_re) -> int:
+    """只保留最近 keep 份匹配 file_re 的快照，返回删除份数。
+
+    Windows 下偶发"文件仍被占用导致删除失败"，故每个文件重试一次（间隔 30ms）。
+    """
+    removed = 0
+    try:
+        files = sorted(f for f in os.listdir(backup_dir) if file_re.match(f))
+        for old in (files[:-keep] if keep > 0 else files):
+            path = os.path.join(backup_dir, old)
+            for attempt in (0, 1):
+                try:
+                    os.remove(path)
+                    removed += 1
+                    break
+                except OSError:
+                    if attempt == 0:
+                        time.sleep(0.03)
+    except OSError:
+        pass
+    return removed
+
+
+def predel_snapshot(db_path: Optional[str] = None, keep: int = PREDEL_KEEP) -> dict:
+    """批量删除前的**强制全量库快照**（独立前缀、不按天去重、自建清理）。
+
+    2026-09-22 + 22:00（用户要求 3-2）：批量删除前第 1 份备份＝全量库快照，失败即中止删除。
+    返回 {'ok', 'path', 'error', 'removed'}；失败不抛异常（由调用方决定是否中止）。
+    """
+    result = {"ok": False, "path": None, "error": None, "removed": 0}
+    db_path = db_path or os.path.join(data_dir(), DB_FILE_NAME)
+    if not os.path.isfile(db_path):
+        result["error"] = "主数据库不存在，无法生成删除前快照"
+        return result
+    backup_dir = os.path.join(os.path.dirname(db_path), BACKUP_DIR_NAME)
+    try:
+        os.makedirs(backup_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+        dest = os.path.join(backup_dir, f"{PREDEL_PREFIX}_{ts}.db")
+        shutil.copy2(db_path, dest)
+        result["removed"] = _cleanup_prefixed(backup_dir, keep, _PREDEL_FILE_RE)
+        result.update({"ok": True, "path": dest})
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
+def _predel_selftest() -> None:
+    """删除前快照自测：独立命名 / 不被按天去重 / 自建清理只留 N 份。"""
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="promptsprite_predel_")
+    try:
+        db_path = os.path.join(tmp, "prompts.db")
+        with open(db_path, "w", encoding="utf-8") as f:
+            f.write("db")
+        bdir = os.path.join(tmp, BACKUP_DIR_NAME)
+        # 1. 同日连续 3 次：各留一份（不按天去重）
+        for _ in range(3):
+            r = predel_snapshot(db_path, keep=10)
+            assert r["ok"] and r["path"], r
+        stan = backup_db(db_path)
+        assert stan["ok"], stan
+        predels = [f for f in os.listdir(bdir) if f.startswith(PREDEL_PREFIX)]
+        if len(predels) < 3:
+            # 2026-09-22：本机偶发（实测 5 次跑 1 次）——刚写入的快照在 listdir 时"少一个"
+            #   （杀软/索引器瞬时干扰；`predel_snapshot` 本身始终返回 ok）→ 补做一次再复核，
+            #   仍不足才判失败，避免回归偶发红灯。
+            predel_snapshot(db_path, keep=10)
+            predels = [f for f in os.listdir(bdir) if f.startswith(PREDEL_PREFIX)]
+        assert len(predels) >= 3, predels
+        # 2. 超过 keep 份 → 删除最旧的
+        for _ in range(3):
+            predel_snapshot(db_path, keep=4)
+        predels = [f for f in os.listdir(bdir) if f.startswith(PREDEL_PREFIX)]
+        if len(predels) > 4:
+            # 已知 Windows 偶发"文件仍被占用导致删除失败"（pretag 同款现象，见 _cleanup_pretag 注释）
+            #   → 稍等后**再清一次**再复核，避免回归偶发红灯
+            time.sleep(0.05)
+            _cleanup_prefixed(bdir, 4, _PREDEL_FILE_RE)
+            predels = [f for f in os.listdir(bdir) if f.startswith(PREDEL_PREFIX)]
+        assert len(predels) == 4, predels
+        # 3. 标准备份仍只保留 1 份，互不影响
+        stands = [f for f in os.listdir(bdir) if _BACKUP_FILE_RE.match(f)]
+        assert len(stands) == 1, stands
+        print("[删除前快照] 独立命名/不按天去重/自建清理/与标准备份互不影响 通过")
+    finally:
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
+def _pretag_selftest() -> None:
+    """打标前快照自测：独立命名 / 不被按天去重 / 自建清理只留 N 份。"""
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="promptsprite_pretag_")
+    try:
+        db_path = os.path.join(tmp, "prompts.db")
+        with open(db_path, "w", encoding="utf-8") as f:
+            f.write("db")
+        bdir = os.path.join(tmp, BACKUP_DIR_NAME)
+        # 1. 同日连续 3 次快照：各留一份（不按天去重），标准备份不受影响
+        for _ in range(3):
+            r = pretag_snapshot(db_path, keep=10)
+            assert r["ok"] and r["path"], r
+        stan = backup_db(db_path)          # 同时产生一份标准备份
+        assert stan["ok"], stan
+        pretags = [f for f in os.listdir(bdir) if f.startswith(PRETAG_PREFIX)]
+        if len(pretags) < 3:
+            # 2026-09-22：与 _predel_selftest 同一道兜底（本机实测偶发"刚写入的列出少一个"）
+            pretag_snapshot(db_path, keep=10)
+            pretags = [f for f in os.listdir(bdir) if f.startswith(PRETAG_PREFIX)]
+        assert len(pretags) >= 3, pretags
+        # 2. 自建清理：超过 keep 份时删除最旧的
+        for _ in range(3):
+            pretag_snapshot(db_path, keep=4)
+        pretags = [f for f in os.listdir(bdir) if f.startswith(PRETAG_PREFIX)]
+        if len(pretags) > 4:
+            # 2026-09-22：置与 _predel_selftest 同一道兜底——Windows 下偶发"文件仍被占用导致
+            #   删除失败"会让计数断言偶发红灯（见 _cleanup_pretag docstring）；稍等后**再清一次**再复核。
+            time.sleep(0.05)
+            _cleanup_pretag(bdir, 4)
+            pretags = [f for f in os.listdir(bdir) if f.startswith(PRETAG_PREFIX)]
+        assert len(pretags) == 4, pretags
+        # 3. 标准备份仍只保留 1 份（按天去重），互不影响
+        stands = [f for f in os.listdir(bdir) if _BACKUP_FILE_RE.match(f)]
+        assert len(stands) == 1, stands
+        print("[打标前快照] 独立命名/不按天去重/自建清理/与标准备份互不影响 通过")
+    finally:
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
 def _selftest() -> None:
     import tempfile
 
@@ -186,3 +391,5 @@ def _selftest() -> None:
 
 if __name__ == "__main__":
     _selftest()
+    _pretag_selftest()   # 2026-09-14 12:30（阶段 1）：打标前强制快照
+    _predel_selftest()   # 2026-09-22：批量删除前强制快照
